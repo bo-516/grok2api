@@ -64,6 +64,9 @@ func Parse(body []byte) (*Request, error) {
 	if err := fillTools(raw, req); err != nil {
 		return nil, err
 	}
+	if err := fillLegacy(raw, req); err != nil {
+		return nil, err
+	}
 	if err := fillFormat(raw["response_format"], req); err != nil {
 		return nil, err
 	}
@@ -129,7 +132,7 @@ func fillMessages(raw json.RawMessage, req *Request) error {
 	for _, m := range arr {
 		role := unquote(m["role"])
 		switch role {
-		case "system", "developer", "user", "assistant", "tool":
+		case "system", "developer", "user", "assistant", "tool", "function":
 		default:
 			if role == "" {
 				role = "missing"
@@ -140,13 +143,23 @@ func fillMessages(raw json.RawMessage, req *Request) error {
 		if err != nil {
 			return err
 		}
-		msg := Message{Role: role, Text: text, ToolCallID: unquote(m["tool_call_id"])}
+		msg := Message{Role: role, Text: text, ToolCallID: unquote(m["tool_call_id"]), Name: unquote(m["name"])}
+		if role == "function" && msg.Name == "" {
+			return bad("unsupported_parameter", `role "function" requires name`)
+		}
 		if calls, ok := m["tool_calls"]; ok && string(bytes.TrimSpace(calls)) != "null" {
 			parsed, err := parseToolCalls(calls)
 			if err != nil {
 				return err
 			}
 			msg.ToolCalls = parsed
+		}
+		if fc, ok := m["function_call"]; ok && string(bytes.TrimSpace(fc)) != "null" {
+			call, err := parseFunctionCall(fc)
+			if err != nil {
+				return err
+			}
+			msg.ToolCalls = append(msg.ToolCalls, call)
 		}
 		req.Messages = append(req.Messages, msg)
 	}
@@ -210,7 +223,7 @@ func parseToolCalls(raw json.RawMessage) ([]ToolCall, error) {
 		if name == "" {
 			return nil, bad("unsupported_parameter", `tool_calls function name is required`)
 		}
-		out = append(out, ToolCall{ID: unquote(c["id"]), Name: name, Arguments: unquote(fn["arguments"])})
+		out = append(out, ToolCall{ID: unquote(c["id"]), Name: name, Arguments: asArgumentString(fn["arguments"])})
 	}
 	return out, nil
 }
@@ -238,9 +251,9 @@ func fillTools(raw map[string]json.RawMessage, req *Request) error {
 			if name == "" {
 				return bad("unsupported_parameter", `parameter "tools" is missing a function name`)
 			}
-			def := ToolDef{Name: name, Description: unquote(fn["description"])}
-			if p, ok := fn["parameters"]; ok && string(bytes.TrimSpace(p)) != "null" {
-				def.Parameters = append(json.RawMessage(nil), p...)
+			def, err := toolDef(name, unquote(fn["description"]), fn["parameters"], fn["strict"])
+			if err != nil {
+				return err
 			}
 			req.Tools = append(req.Tools, def)
 		}

@@ -53,6 +53,9 @@ type Request struct {
 	ResponseFormat *ResponseFormat
 	// ReasoningEffort is a legal effort or empty. Illegal values never reach this struct.
 	ReasoningEffort string
+	// Legacy is true when the caller used functions/function_call instead of tools/tool_choice.
+	// The response then uses function_call and finish_reason function_call. One call only.
+	Legacy bool
 	// Ignored is the sorted-by-table list of inert sampling fields present on the request.
 	Ignored []string
 }
@@ -67,6 +70,8 @@ type Message struct {
 	ToolCalls []ToolCall
 	// ToolCallID links a tool result to the assistant call id.
 	ToolCallID string
+	// Name is the function name on a legacy role:function message.
+	Name string
 }
 
 // ToolCall is an assistant function call already in the conversation.
@@ -87,6 +92,9 @@ type ToolDef struct {
 	Description string
 	// Parameters is the JSON schema for arguments. Empty means an object.
 	Parameters json.RawMessage
+	// Strict is function.strict. The schema was checked at parse time.
+	// Output arguments that do not match are rejected instead of returned.
+	Strict bool
 }
 
 // ToolChoice selects how tools are used.

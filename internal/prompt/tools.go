@@ -30,7 +30,8 @@ type Outcome struct {
 
 // buildEnvelope creates the strict anyOf schema grok 1.0.41 accepted.
 // tool_choice required or a named function removes the reply action.
-// parallel_tool_calls false and a named function set maxItems to 1.
+// parallel_tool_calls false, and a legacy functions request, set maxItems to 1.
+// A named function with parallel calls allowed does not cap the count.
 // When response_format is also set, the reply content property is that schema
 // instead of a string; the server stringifies the object into message content.
 func buildEnvelope(req *openai.Request) (*envelope, error) {
@@ -70,11 +71,13 @@ func buildEnvelope(req *openai.Request) (*envelope, error) {
 	if force {
 		actions = []string{"call_tools"}
 	}
+	contentIsText := true
 	var content any = map[string]any{"type": "string"}
 	if req.ResponseFormat != nil && len(req.ResponseFormat.Schema) > 0 {
 		var schema any
 		if json.Unmarshal(req.ResponseFormat.Schema, &schema) == nil {
 			content = schema
+			contentIsText = false
 		}
 	}
 	toolCalls := map[string]any{
@@ -87,7 +90,9 @@ func buildEnvelope(req *openai.Request) (*envelope, error) {
 		minCalls = 1
 		toolCalls["minItems"] = 1
 	}
-	if (req.Parallel != nil && !*req.Parallel) || req.ToolChoice.Kind == "function" {
+	// OpenAI allows several calls of one named function unless parallel_tool_calls is false.
+	// Legacy function_call can carry only one call, so that path stays capped.
+	if req.Legacy || (req.Parallel != nil && !*req.Parallel) {
 		maxCalls = 1
 		toolCalls["maxItems"] = 1
 	}
@@ -107,7 +112,7 @@ func buildEnvelope(req *openai.Request) (*envelope, error) {
 	}
 	return &envelope{
 		schema:       raw,
-		instructions: instructions(allowed, force, req.ToolChoice.Name),
+		instructions: instructions(allowed, force, req.ToolChoice.Name, maxCalls, contentIsText),
 		names:        names,
 		force:        force,
 		maxCalls:     maxCalls,
@@ -117,7 +122,8 @@ func buildEnvelope(req *openai.Request) (*envelope, error) {
 
 // instructions is the function manual appended to the system text.
 // It tells the model to copy argument strings verbatim so a city written as 北京 stays 北京.
-func instructions(tools []openai.ToolDef, force bool, only string) string {
+// maxCalls 1 asks for a single call. contentIsText allows a short preamble beside tool calls.
+func instructions(tools []openai.ToolDef, force bool, only string, maxCalls int, contentIsText bool) string {
 	var b strings.Builder
 	b.WriteString("Functions you may call:\n")
 	for _, t := range tools {
@@ -137,79 +143,161 @@ func instructions(tools []openai.ToolDef, force bool, only string) string {
 	}
 	b.WriteString("\nCopy argument values verbatim from the user message. Do not translate, transliterate, or rename places or other strings.\n")
 	b.WriteString("Respond only as JSON matching the schema. ")
-	if force && only != "" {
+	if force && only != "" && maxCalls == 1 {
 		b.WriteString("You must call " + only + " exactly once. action must be call_tools.")
+	} else if force && only != "" {
+		b.WriteString("You must call " + only + ". You may call it more than once. action must be call_tools.")
 	} else if force {
 		b.WriteString("You must call at least one function. action must be call_tools.")
 	} else {
 		b.WriteString(`Use action "reply" and put the user-facing text in content when no function is needed. Use action "call_tools" with tool_calls when a function is needed.`)
 	}
+	if contentIsText {
+		b.WriteString(" When action is call_tools, content may be a short preamble or an empty string.")
+	}
 	return b.String()
 }
 
+// toolEnvelope is the JSON object the model returns for a tool turn.
+type toolEnvelope struct {
+	Action    string          `json:"action"`
+	Content   json.RawMessage `json:"content"`
+	ToolCalls []struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"tool_calls"`
+}
+
 // ParseOutcome reads structured_output or the result text as an envelope.
-// Unknown tool names and non-object arguments are grok_bad_output (code returned
-// as an error string prefix the server maps). Invalid JSON is grok_structured_output_failed.
-// limits come from Rendered. names is the allow list.
-func ParseOutcome(structured []byte, text string, names []string, minCalls, maxCalls int) (*Outcome, error) {
+// Unknown tool names are returned to the caller. Arguments are kept as a string
+// even when they are not a JSON object, matching OpenAI. A broken envelope, or
+// call_tools with fewer calls than minCalls, becomes a normal text reply.
+// A strict tool whose arguments do not match its schema is grok_structured_output_failed.
+// tools carry strict schemas. minCalls and maxCalls come from Rendered. maxCalls 0 means no cap.
+func ParseOutcome(structured []byte, text string, tools []openai.ToolDef, minCalls, maxCalls int) (*Outcome, error) {
 	raw := structured
-	if len(raw) == 0 {
+	if len(strings.TrimSpace(string(raw))) == 0 {
 		raw = []byte(strings.TrimSpace(text))
 	}
-	if len(raw) == 0 {
+	if len(strings.TrimSpace(string(raw))) == 0 {
 		return nil, envelopeErr("grok_structured_output_failed", "grok returned an empty tool envelope")
 	}
-	var env struct {
-		Action    string          `json:"action"`
-		Content   json.RawMessage `json:"content"`
-		ToolCalls []struct {
-			Name      string          `json:"name"`
-			Arguments json.RawMessage `json:"arguments"`
-		} `json:"tool_calls"`
-	}
-	if json.Unmarshal(raw, &env) != nil || (env.Action != "reply" && env.Action != "call_tools") {
-		// The text may be a JSON string wrapping the object. Try once more if structured was empty.
-		if len(structured) == 0 {
-			var inner string
-			if json.Unmarshal(raw, &inner) == nil {
-				return ParseOutcome([]byte(inner), "", names, minCalls, maxCalls)
-			}
+	env, ok := decodeEnvelope(raw)
+	if !ok && len(strings.TrimSpace(string(structured))) == 0 {
+		var inner string
+		if json.Unmarshal(raw, &inner) == nil && strings.TrimSpace(inner) != "" {
+			return ParseOutcome([]byte(inner), "", tools, minCalls, maxCalls)
 		}
-		return nil, envelopeErr("grok_structured_output_failed", "grok tool envelope was not valid JSON with action reply or call_tools")
+	}
+	if !ok {
+		return textReply(text, raw), nil
+	}
+	content, err := stringifyContent(env.Content)
+	if err != nil {
+		return textReply(text, raw), nil
 	}
 	if env.Action == "reply" {
-		content, err := stringifyContent(env.Content)
-		if err != nil {
-			return nil, envelopeErr("grok_structured_output_failed", "grok reply content was not usable JSON")
-		}
 		return &Outcome{Reply: true, Content: content}, nil
 	}
-	if len(env.ToolCalls) < minCalls || (maxCalls > 0 && len(env.ToolCalls) > maxCalls) {
-		return nil, envelopeErr("grok_bad_output", "grok tool envelope had the wrong number of tool calls")
+	calls, err := collectCalls(env, tools)
+	if err != nil {
+		return nil, err
 	}
-	allow := map[string]bool{}
-	for _, n := range names {
-		allow[n] = true
+	if maxCalls > 0 && len(calls) > maxCalls {
+		calls = calls[:maxCalls]
 	}
-	out := &Outcome{}
+	if len(calls) == 0 || len(calls) < minCalls {
+		return &Outcome{Reply: true, Content: content}, nil
+	}
+	return &Outcome{Content: content, Calls: calls}, nil
+}
+
+// decodeEnvelope parses one envelope object. ok is false when the JSON is not an envelope.
+// A JSON string or a missing action is not an envelope. The caller then falls back to text.
+func decodeEnvelope(raw []byte) (toolEnvelope, bool) {
+	var env toolEnvelope
+	if json.Unmarshal(raw, &env) != nil {
+		return toolEnvelope{}, false
+	}
+	if env.Action != "reply" && env.Action != "call_tools" {
+		return toolEnvelope{}, false
+	}
+	return env, true
+}
+
+// textReply is the 200 fallback when the model did not produce a usable envelope.
+// Non-empty text wins. Otherwise the raw bytes are the assistant content.
+func textReply(text string, raw []byte) *Outcome {
+	if s := strings.TrimSpace(text); s != "" {
+		return &Outcome{Reply: true, Content: s}
+	}
+	return &Outcome{Reply: true, Content: strings.TrimSpace(string(raw))}
+}
+
+// collectCalls turns envelope tool_calls into OpenAI tool results.
+// An empty name is skipped. Strict tools are checked against their schema.
+// A strict mismatch returns grok_structured_output_failed and no partial list.
+func collectCalls(env toolEnvelope, tools []openai.ToolDef) ([]openai.ToolResult, error) {
+	var out []openai.ToolResult
 	for _, c := range env.ToolCalls {
-		if !allow[c.Name] {
-			return nil, envelopeErr("grok_bad_output", "grok called unknown tool "+c.Name)
+		if c.Name == "" {
+			continue
 		}
-		if !jsonObject(c.Arguments) {
-			return nil, envelopeErr("grok_bad_output", "grok tool arguments for "+c.Name+" were not a JSON object")
-		}
-		args, err := compact(c.Arguments)
-		if err != nil {
-			return nil, envelopeErr("grok_bad_output", "grok tool arguments for "+c.Name+" were not valid JSON")
+		args, obj, isObj := argumentValue(c.Arguments)
+		if def, ok := findTool(tools, c.Name); ok && def.Strict {
+			if !isObj {
+				return nil, envelopeErr("grok_structured_output_failed", "tool "+c.Name+" arguments did not match the strict schema")
+			}
+			if err := openai.MatchStrictArgs(def.Parameters, obj); err != nil {
+				return nil, envelopeErr("grok_structured_output_failed", "tool "+c.Name+" arguments did not match the strict schema")
+			}
 		}
 		id, err := newCallID()
 		if err != nil {
 			return nil, err
 		}
-		out.Calls = append(out.Calls, openai.ToolResult{ID: id, Name: c.Name, Arguments: args})
+		out = append(out, openai.ToolResult{ID: id, Name: c.Name, Arguments: args})
 	}
 	return out, nil
+}
+
+// argumentValue converts envelope arguments into the OpenAI arguments string.
+// An object is compact JSON. A JSON string is unquoted. Any other JSON value is compact JSON.
+// Invalid JSON is returned as the raw text. isObj is true only for a JSON object, and obj is that object.
+func argumentValue(raw json.RawMessage) (args string, obj json.RawMessage, isObj bool) {
+	raw = json.RawMessage(strings.TrimSpace(string(raw)))
+	if len(raw) == 0 || string(raw) == "null" {
+		return "{}", nil, false
+	}
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		return string(raw), nil, false
+	}
+	if _, ok := v.(map[string]any); ok {
+		s, err := compact(raw)
+		if err != nil {
+			return string(raw), nil, false
+		}
+		return s, json.RawMessage(s), true
+	}
+	if s, ok := v.(string); ok {
+		return s, nil, false
+	}
+	s, err := compact(raw)
+	if err != nil {
+		return string(raw), nil, false
+	}
+	return s, nil, false
+}
+
+// findTool returns the declared tool with this name. The second result is false when name is unknown.
+func findTool(tools []openai.ToolDef, name string) (openai.ToolDef, bool) {
+	for _, t := range tools {
+		if t.Name == name {
+			return t, true
+		}
+	}
+	return openai.ToolDef{}, false
 }
 
 // stringifyContent turns envelope content into the assistant string.
@@ -227,16 +315,6 @@ func stringifyContent(raw json.RawMessage) (string, error) {
 		return s, nil
 	}
 	return compact(raw)
-}
-
-// jsonObject reports whether raw is a JSON object.
-func jsonObject(raw json.RawMessage) bool {
-	var v any
-	if json.Unmarshal(raw, &v) != nil {
-		return false
-	}
-	_, ok := v.(map[string]any)
-	return ok
 }
 
 // compact re-encodes JSON with no extra space.

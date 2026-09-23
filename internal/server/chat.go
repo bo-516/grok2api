@@ -102,7 +102,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	used := s.usedModel(final.Model, grokModel)
 	rec.usedModel = used
 	if rendered.Envelope {
-		out, err := prompt.ParseOutcome(final.Structured, final.Text, rendered.AllowedTools, rendered.MinCalls, rendered.MaxCalls)
+		out, err := prompt.ParseOutcome(final.Structured, final.Text, req.Tools, rendered.MinCalls, rendered.MaxCalls)
 		if err != nil {
 			s.fail(w, rec, err, final.SessionID, req.Ignored)
 			return
@@ -111,7 +111,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			s.pseudo(w, rec, created, final, used, req, out)
 			return
 		}
-		s.writeOutcome(w, rec, created, final, used, req.Ignored, out)
+		s.writeOutcome(w, rec, created, final, used, req, out)
 		return
 	}
 	text := final.Text
@@ -196,7 +196,9 @@ func (s *Server) streamText(ctx context.Context, w http.ResponseWriter, r *http.
 }
 
 // pseudo writes a short SSE stream from a finished run: role, then content or tool calls, then finish.
-// Tool calls are one full delta each. include_usage adds the empty-choices chunk. The stream ends with [DONE].
+// Tool calls follow the OpenAI fragment shape: name first, then the arguments string.
+// A legacy functions request uses function_call instead. include_usage adds the empty-choices chunk.
+// The stream ends with [DONE].
 func (s *Server) pseudo(w http.ResponseWriter, rec *logRec, created int64, final grok.Final, used string, req *openai.Request, out *prompt.Outcome) {
 	sw := newSSE(w, 0)
 	defer sw.Close()
@@ -204,13 +206,18 @@ func (s *Server) pseudo(w http.ResponseWriter, rec *logRec, created int64, final
 	if err := sw.begin(func(h http.Header) { setRunHeaders(h, final.SessionID, req.Ignored) }); err != nil {
 		return
 	}
-	_ = sw.Send(openai.RoleChunk(id, created, used))
-	if out != nil && !out.Reply {
-		for i, c := range out.Calls {
-			_ = sw.Send(openai.ToolChunk(id, created, used, i, c))
+	if out != nil && !out.Reply && len(out.Calls) > 0 {
+		var chunks []openai.Chunk
+		if req.Legacy {
+			chunks = openai.FunctionCallChunks(id, created, used, out.Content, out.Calls[0])
+		} else {
+			chunks = openai.ToolCallChunks(id, created, used, out.Content, out.Calls)
 		}
-		_ = sw.Send(openai.FinishChunk(id, created, used, "tool_calls"))
+		for _, ch := range chunks {
+			_ = sw.Send(ch)
+		}
 	} else {
+		_ = sw.Send(openai.RoleChunk(id, created, used))
 		text := ""
 		if out != nil {
 			text = out.Content
@@ -236,16 +243,34 @@ func (s *Server) writeText(w http.ResponseWriter, rec *logRec, created int64, fi
 }
 
 // writeOutcome writes a non-streaming tool-call or envelope reply completion.
-func (s *Server) writeOutcome(w http.ResponseWriter, rec *logRec, created int64, final grok.Final, used string, ignored []string, out *prompt.Outcome) {
-	setRunHeaders(w.Header(), final.SessionID, ignored)
-	if out.Reply {
+// A non-empty preamble is message.content next to tool_calls. Empty content stays null.
+// Legacy requests write function_call and finish_reason function_call, and only the first call.
+func (s *Server) writeOutcome(w http.ResponseWriter, rec *logRec, created int64, final grok.Final, used string, req *openai.Request, out *prompt.Outcome) {
+	setRunHeaders(w.Header(), final.SessionID, req.Ignored)
+	if out.Reply || len(out.Calls) == 0 {
 		text := out.Content
 		body := openai.NewCompletion(openai.CompletionID(final.SessionID), created, used, openai.MapFinishReason(final.StopReason), &text, nil, usageOf(final))
 		writeJSON(w, http.StatusOK, body)
 		rec.status = http.StatusOK
 		return
 	}
-	body := openai.NewCompletion(openai.CompletionID(final.SessionID), created, used, "tool_calls", nil, out.Calls, usageOf(final))
+	var content *string
+	if out.Content != "" {
+		text := out.Content
+		content = &text
+	}
+	calls := out.Calls
+	finish := "tool_calls"
+	if req.Legacy {
+		finish = "function_call"
+		calls = calls[:1]
+	}
+	body := openai.NewCompletion(openai.CompletionID(final.SessionID), created, used, finish, content, calls, usageOf(final))
+	if req.Legacy {
+		c := calls[0]
+		body.Choices[0].Message.FunctionCall = &openai.FunctionWire{Name: c.Name, Arguments: c.Arguments}
+		body.Choices[0].Message.ToolCalls = nil
+	}
 	writeJSON(w, http.StatusOK, body)
 	rec.status = http.StatusOK
 }

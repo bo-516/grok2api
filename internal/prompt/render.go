@@ -129,23 +129,26 @@ func renderPrompt(convo []openai.Message) string {
 		switch m.Role {
 		case "assistant":
 			b.WriteString(`<message role="assistant">`)
-			if len(m.ToolCalls) == 0 {
-				b.WriteString(m.Text)
-			} else {
-				for _, c := range m.ToolCalls {
-					b.WriteString(`<tool_call id="`)
-					b.WriteString(c.ID)
-					b.WriteString(`" name="`)
-					b.WriteString(c.Name)
-					b.WriteString(`">`)
-					b.WriteString(c.Arguments)
-					b.WriteString(`</tool_call>`)
-				}
+			b.WriteString(m.Text)
+			for _, c := range m.ToolCalls {
+				b.WriteString(`<tool_call id="`)
+				b.WriteString(c.ID)
+				b.WriteString(`" name="`)
+				b.WriteString(c.Name)
+				b.WriteString(`">`)
+				b.WriteString(c.Arguments)
+				b.WriteString(`</tool_call>`)
 			}
 			b.WriteString("</message>\n")
 		case "tool":
 			b.WriteString(`<message role="tool" tool_call_id="`)
 			b.WriteString(m.ToolCallID)
+			b.WriteString(`">`)
+			b.WriteString(m.Text)
+			b.WriteString("</message>\n")
+		case "function":
+			b.WriteString(`<message role="function" name="`)
+			b.WriteString(m.Name)
 			b.WriteString(`">`)
 			b.WriteString(m.Text)
 			b.WriteString("</message>\n")
@@ -160,7 +163,7 @@ func renderPrompt(convo []openai.Message) string {
 	b.WriteString("</conversation>\n")
 	b.WriteString("Write the assistant's next message.")
 	for _, m := range convo {
-		if m.Role == "tool" || len(m.ToolCalls) > 0 {
+		if m.Role == "tool" || m.Role == "function" || len(m.ToolCalls) > 0 {
 			b.WriteString(" If a tool result is present, base the reply on it and include its values.")
 			break
 		}

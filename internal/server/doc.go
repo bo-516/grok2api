@@ -117,17 +117,21 @@ choices[0].message.content 是 JSON 文本，按 schema 解析。
 {"type":"function","function":{"name":"get_weather","description":"查询天气","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}
 
 tool_choice 可用 "auto"、"none"、"required"，或 {"type":"function","function":{"name":"get_weather"}}。
-只要一个调用时加 "parallel_tool_calls":false。
+只要一个调用时加 "parallel_tool_calls":false。不写或写 true 时，指定了函数名也可以返回多次调用。
 需要调用工具时 finish_reason 为 tool_calls，调用在 choices[0].message.tool_calls，参数是 function.arguments 字符串。
+message.content 可能同时有一段说明；没有说明时 content 为 null。
+流式时先给出函数名和空的 arguments，下一段才是完整 arguments 字符串，最后 finish_reason 为 tool_calls。
+函数要严格符合 schema 时加 "strict": true。这时 parameters 必须是 object，additionalProperties 为 false，properties 里的每个字段都在 required 里，嵌套对象也一样，否则 400。
+旧写法：用 functions 代替 tools，用 function_call 代替 tool_choice（"auto"、"none" 或 {"name":"get_weather"}）。不要和 tools 或 tool_choice 一起用。这种请求的回复是 message.function_call，finish_reason 为 function_call。
 下一轮把这条 assistant 消息原样放回 messages，再追加：
 
 {"role":"tool","tool_call_id":"<上一步的 id>","content":"<工具返回的文本>"}
 
-然后再次 POST。
+旧写法的工具结果是 {"role":"function","name":"get_weather","content":"<工具返回的文本>"}。然后再次 POST。
 
 5. 消息
 
-role 可用 system、developer、user、assistant、tool。
+role 可用 system、developer、user、assistant、tool、function。
 content 用字符串，或 [{"type":"text","text":"..."}]。多段文本会按换行拼成一段。
 
 可选 reasoning_effort：none、minimal、low、medium、high、xhigh、max、deep。

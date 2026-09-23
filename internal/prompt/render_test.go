@@ -71,14 +71,31 @@ func TestEnvelopeAnyOf(t *testing.T) {
 		t.Fatal(err)
 	}
 	schema := string(out.JSONSchema)
-	if !strings.Contains(schema, "anyOf") || !strings.Contains(schema, "get_weather") || !strings.Contains(schema, `"minItems":1`) || !strings.Contains(schema, `"maxItems":1`) {
+	if !strings.Contains(schema, "anyOf") || !strings.Contains(schema, "get_weather") || !strings.Contains(schema, `"minItems":1`) || strings.Contains(schema, `"maxItems"`) {
 		t.Fatal(schema)
 	}
-	if !strings.Contains(out.SystemOverride, "get_weather") || !strings.Contains(out.SystemOverride, "verbatim") {
+	if !strings.Contains(out.SystemOverride, "get_weather") || !strings.Contains(out.SystemOverride, "verbatim") || !strings.Contains(out.SystemOverride, "more than once") {
 		t.Fatal(out.SystemOverride)
 	}
-	if !out.ForceCalls || out.MaxCalls != 1 || out.MinCalls != 1 {
+	if !out.ForceCalls || out.MaxCalls != 0 || out.MinCalls != 1 {
 		t.Fatalf("%+v", out)
+	}
+}
+
+// TestParallelFalseCapsCalls sets maxItems only when parallel_tool_calls is false.
+func TestParallelFalseCapsCalls(t *testing.T) {
+	off := false
+	out, err := Render(&openai.Request{
+		Messages:   []openai.Message{{Role: "user", Text: "hi"}},
+		Tools:      []openai.ToolDef{{Name: "get_weather"}},
+		ToolChoice: openai.ToolChoice{Kind: "function", Name: "get_weather"},
+		Parallel:   &off,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.MaxCalls != 1 || !strings.Contains(string(out.JSONSchema), `"maxItems":1`) {
+		t.Fatalf("%d %s", out.MaxCalls, out.JSONSchema)
 	}
 }
 
@@ -99,21 +116,44 @@ func TestToolChoiceNoneSkipsEnvelope(t *testing.T) {
 
 // TestParseOutcomeReadsRecordedEnvelope uses the tools fixture's structured object shape.
 func TestParseOutcomeReadsRecordedEnvelope(t *testing.T) {
-	raw := []byte(`{"action":"call_tools","tool_calls":[{"name":"get_weather","arguments":{"city":"北京"}}]}`)
-	out, err := ParseOutcome(raw, "", []string{"get_weather"}, 0, 0)
+	tools := []openai.ToolDef{{Name: "get_weather"}}
+	raw := []byte(`{"action":"call_tools","content":"checking","tool_calls":[{"name":"get_weather","arguments":{"city":"北京"}}]}`)
+	out, err := ParseOutcome(raw, "", tools, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Reply || len(out.Calls) != 1 || out.Calls[0].Name != "get_weather" || !strings.Contains(out.Calls[0].Arguments, "北京") {
+	if out.Reply || out.Content != "checking" || len(out.Calls) != 1 || out.Calls[0].Name != "get_weather" || !strings.Contains(out.Calls[0].Arguments, "北京") {
 		t.Fatalf("%+v", out)
 	}
 	if !strings.HasPrefix(out.Calls[0].ID, "call_") || len(out.Calls[0].ID) != len("call_")+24 {
 		t.Fatal(out.Calls[0].ID)
 	}
-	if _, err := ParseOutcome([]byte(`{"action":"call_tools","tool_calls":[{"name":"rm","arguments":{"x":1}}]}`), "", []string{"get_weather"}, 0, 0); err == nil {
-		t.Fatal("expected unknown tool")
+	unknown, err := ParseOutcome([]byte(`{"action":"call_tools","tool_calls":[{"name":"rm","arguments":{"x":1}}]}`), "", tools, 0, 0)
+	if err != nil || unknown.Reply || unknown.Calls[0].Name != "rm" {
+		t.Fatal(err, unknown)
 	}
-	if _, err := ParseOutcome([]byte(`{"action":"call_tools","tool_calls":[{"name":"get_weather","arguments":"nope"}]}`), "", []string{"get_weather"}, 0, 0); err == nil {
-		t.Fatal("expected bad arguments")
+	stringArgs, err := ParseOutcome([]byte(`{"action":"call_tools","tool_calls":[{"name":"get_weather","arguments":"nope"}]}`), "", tools, 0, 0)
+	if err != nil || stringArgs.Calls[0].Arguments != "nope" {
+		t.Fatal(err, stringArgs)
+	}
+	fallback, err := ParseOutcome(nil, "just text", tools, 1, 0)
+	if err != nil || !fallback.Reply || fallback.Content != "just text" {
+		t.Fatal(err, fallback)
+	}
+}
+
+// TestParseOutcomeStrictRejectsMismatch drops a strict call whose arguments add a property.
+func TestParseOutcomeStrictRejectsMismatch(t *testing.T) {
+	tools := []openai.ToolDef{{
+		Name:       "get_weather",
+		Strict:     true,
+		Parameters: []byte(`{"type":"object","additionalProperties":false,"required":["city"],"properties":{"city":{"type":"string"}}}`),
+	}}
+	if _, err := ParseOutcome([]byte(`{"action":"call_tools","tool_calls":[{"name":"get_weather","arguments":{"city":"北京","extra":1}}]}`), "", tools, 0, 0); err == nil {
+		t.Fatal("expected strict mismatch")
+	}
+	out, err := ParseOutcome([]byte(`{"action":"call_tools","tool_calls":[{"name":"get_weather","arguments":{"city":"北京"}}]}`), "", tools, 0, 0)
+	if err != nil || len(out.Calls) != 1 {
+		t.Fatal(err, out)
 	}
 }

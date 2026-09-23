@@ -1,6 +1,9 @@
 package openai
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // Usage is the OpenAI usage object. ReasoningTokens is omitted from JSON when unset.
 type Usage struct {
@@ -56,10 +59,13 @@ type Choice struct {
 type MessageOut struct {
 	// Role is assistant.
 	Role string `json:"role"`
-	// Content is the reply text, or null for a tool-call message.
+	// Content is the reply text, or null when there is no text.
+	// A tool call may still carry a non-null preamble.
 	Content *string `json:"content"`
-	// ToolCalls is omitted for a normal text reply.
+	// ToolCalls is omitted for a normal text reply and for a legacy function_call.
 	ToolCalls []ToolCallWire `json:"tool_calls,omitempty"`
+	// FunctionCall is set only for a legacy functions request that invoked a function.
+	FunctionCall *FunctionWire `json:"function_call,omitempty"`
 }
 
 // ToolCallWire is one OpenAI tool call.
@@ -111,18 +117,90 @@ type ChunkChoice struct {
 }
 
 // Delta is the incremental assistant update.
+// NullContent emits "content":null, which is how a tool-call stream starts.
+// Content and NullContent are not set together. MarshalJSON omits empty fields.
 type Delta struct {
-	Role      string      `json:"role,omitempty"`
-	Content   *string     `json:"content,omitempty"`
-	ToolCalls []ToolDelta `json:"tool_calls,omitempty"`
+	// Role is assistant on the first chunk. Later chunks leave it empty.
+	Role string
+	// Content is a text fragment. Nil omits the field unless NullContent is set.
+	Content *string
+	// NullContent forces content to JSON null. Used on the first tool-call chunk.
+	NullContent bool
+	// ToolCalls are modern function calls. Empty omits the field.
+	ToolCalls []ToolDelta
+	// FunctionCall is the legacy functions delta. Nil omits the field.
+	FunctionCall *FunctionCallDelta
 }
 
-// ToolDelta is one full tool call inside a pseudo-stream chunk.
+// MarshalJSON writes an OpenAI delta. An empty delta is {}.
+// content is null only when NullContent is set. Empty tool ids and types are omitted by ToolDelta.
+func (d Delta) MarshalJSON() ([]byte, error) {
+	buf := map[string]json.RawMessage{}
+	if d.Role != "" {
+		b, err := json.Marshal(d.Role)
+		if err != nil {
+			return nil, err
+		}
+		buf["role"] = b
+	}
+	if d.NullContent {
+		buf["content"] = []byte("null")
+	} else if d.Content != nil {
+		b, err := json.Marshal(*d.Content)
+		if err != nil {
+			return nil, err
+		}
+		buf["content"] = b
+	}
+	if len(d.ToolCalls) > 0 {
+		b, err := json.Marshal(d.ToolCalls)
+		if err != nil {
+			return nil, err
+		}
+		buf["tool_calls"] = b
+	}
+	if d.FunctionCall != nil {
+		b, err := json.Marshal(d.FunctionCall)
+		if err != nil {
+			return nil, err
+		}
+		buf["function_call"] = b
+	}
+	if len(buf) == 0 {
+		return []byte("{}"), nil
+	}
+	return json.Marshal(buf)
+}
+
+// ToolDelta is one tool call fragment inside a stream chunk.
+// ID and Type are omitted when empty so later argument chunks carry only index and arguments.
 type ToolDelta struct {
-	Index    int          `json:"index"`
-	ID       string       `json:"id"`
-	Type     string       `json:"type"`
-	Function FunctionWire `json:"function"`
+	// Index identifies the call across fragments. It is always written, including 0.
+	Index int `json:"index"`
+	// ID is the call id, present on the first fragment only.
+	ID string `json:"id,omitempty"`
+	// Type is function, present on the first fragment only.
+	Type string `json:"type,omitempty"`
+	// Function holds the name, the arguments, or both.
+	Function functionDelta `json:"function"`
+}
+
+// functionDelta is the streamed function object.
+// A non-nil empty Arguments encodes as "" so the first fragment can start the string.
+type functionDelta struct {
+	// Name is the function name. Nil omits it on argument-only fragments.
+	Name *string `json:"name,omitempty"`
+	// Arguments is a fragment of the arguments string. Nil omits it.
+	Arguments *string `json:"arguments,omitempty"`
+}
+
+// FunctionCallDelta is the legacy streamed function_call object.
+// Name is set on the first fragment. Arguments grows across fragments.
+type FunctionCallDelta struct {
+	// Name is the function name. Nil omits it.
+	Name *string `json:"name,omitempty"`
+	// Arguments is a fragment of the arguments string. Nil omits it.
+	Arguments *string `json:"arguments,omitempty"`
 }
 
 // CompletionID builds chatcmpl-<session without hyphens>.
@@ -178,17 +256,6 @@ func ContentChunk(id string, created int64, model, text string) Chunk {
 	return Chunk{
 		ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
 		Choices: []ChunkChoice{{Index: 0, Delta: Delta{Content: &text}}},
-	}
-}
-
-// ToolChunk is one full tool call in a pseudo-stream.
-func ToolChunk(id string, created int64, model string, index int, call ToolResult) Chunk {
-	return Chunk{
-		ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
-		Choices: []ChunkChoice{{Index: 0, Delta: Delta{ToolCalls: []ToolDelta{{
-			Index: index, ID: call.ID, Type: "function",
-			Function: FunctionWire{Name: call.Name, Arguments: call.Arguments},
-		}}}}},
 	}
 }
 
