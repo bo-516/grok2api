@@ -1,27 +1,49 @@
-# agent-mock
+# grok2api
 
-本地开发用的 OpenAI Chat Completions 兼容服务。每个请求启动一次你本机已登录的 `grok`，把回复转成 `/v1/chat/completions`。
+本地开发用的 OpenAI Chat Completions 兼容服务。仓库：<https://github.com/bo-516/grok2api>。
+
+每个请求启动一次你本机已登录的 `grok`，把回复转成 `/v1/chat/completions`。给别的程序用时，模型名写 `superllm`。
 
 这是开发替身，不是生产服务。提示词会经 grok 发到 xAI。不要发送真实用户数据、密钥或未公开的代码。
 
 ## 准备
 
 1. 安装 [Grok Build](https://x.ai) CLI，并执行一次 `grok login`（SuperGrok / X Premium+，按你自己的订阅）。
-2. 不需要 OpenAI 或 xAI 的按量 API Key。子进程会去掉 `XAI_API_KEY`，避免静默改走按量计费。
+2. 安装 Go 1.25。
+3. 不需要 OpenAI 或 xAI 的按量 API Key。子进程会去掉 `XAI_API_KEY`，避免静默改走按量计费。
 
 ```bash
-go install github.com/shaoboli/agent-mock/cmd/agent-mock@latest
-agent-mock
+git clone https://github.com/bo-516/grok2api.git
+cd grok2api
+go run ./cmd/agent-mock
 ```
 
-启动后终端会打印 grok 路径、登录状态、模型、工具集检查，以及要贴进后端的两行环境变量：
+要装到 `PATH` 里，在仓库目录执行 `go install ./cmd/agent-mock`，然后直接运行 `agent-mock`。
+
+启动后终端会打印 grok 路径、登录状态、模型，以及要贴进调用方的两行环境变量：
 
 ```text
 OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 OPENAI_API_KEY=dev
 ```
 
+调用时 `model` 固定写 `superllm`。用法也可以直接读：
+
+```bash
+curl -sS http://127.0.0.1:8787/doc
+```
+
 `temperature`、`top_p`、`max_tokens`、`max_completion_tokens`、`stop`、`seed` 和 penalty 会被接受但不会传给 grok。响应头 `X-Agent-Mock-Ignored` 列出它们。`n>1` 和 `logprobs` 返回 400。
+
+## 调用
+
+普通文本、流式、`json_schema` / `json_object`、工具调用都走 `POST /v1/chat/completions`。
+
+工具请求使用 `tools` 和 `tool_choice`（`auto`、`none`、`required`，或指定函数）。需要调用时 `finish_reason` 为 `tool_calls`，参数在 `function.arguments` 字符串里。把这条 assistant 消息原样放回，再追加 `role: "tool"` 的结果，然后再次 POST。
+
+`strict: true` 时，参数 schema 必须是 object，`additionalProperties` 为 false，并且每个字段都在 `required` 里。旧参数 `functions` / `function_call` 也可以用，不要和 `tools` 同时写。
+
+Go 程序只改 base URL 和 API key，继续用 `Chat.Completions.New` 和 `NewStreaming`。图片、音频和文件内容会返回 400。
 
 ## 安全
 
@@ -53,10 +75,9 @@ OPENAI_API_KEY=dev
 
 ## 冒烟
 
+另开一个终端，在仓库目录里：
+
 ```bash
-agent-mock
 ./scripts/smoke.sh
 OPENAI_BASE_URL=http://127.0.0.1:8787/v1 OPENAI_API_KEY=dev go run ./examples/go-openai
 ```
-
-Go 后端只改 base URL 和 API key，继续用 `Chat.Completions.New` 和 `NewStreaming`。图片、音频和文件内容会返回 400。
