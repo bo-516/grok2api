@@ -21,6 +21,8 @@ const probePrompt = "agent-mock-toolset-probe"
 
 // main dispatches version, models, sessions, the toolset probe, and fixture replay.
 // SIGTERM is ignored so agent-mock's 5s SIGKILL path is what actually ends a hung run.
+// A prompt run first persists its session and prompt-history line under GROK_HOME
+// (see persist), then echoes --session-id wherever the recorded output has an id.
 func main() {
 	signalIgnore()
 	args := os.Args[1:]
@@ -44,12 +46,11 @@ func main() {
 	body := readFile(promptPath)
 	writePID()
 	writeReport(args, promptPath, body)
+	sid := flagValue(args, "--session-id")
+	persist(args, body, sid)
 	if strings.TrimSpace(body) == probePrompt {
-		tools := os.Getenv("FAKEGROK_PROBE_TOOLS")
-		if tools == "" {
-			tools = "[]"
-		}
-		fmt.Printf("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"probe\",\"model\":\"grok-4.7-build-fast\",\"permissionMode\":\"dontAsk\",\"tools\":%s}\n", tools)
+		tools := probeToolsJSON(args)
+		fmt.Printf("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":%q,\"model\":\"grok-4.7-build-fast\",\"permissionMode\":\"dontAsk\",\"tools\":%s}\n", idOr(args, "probe"), tools)
 		_ = os.Stdout.Sync()
 		time.Sleep(30 * time.Second)
 		return
@@ -65,30 +66,82 @@ func main() {
 	switch scenario {
 	case "silent":
 		time.Sleep(45 * time.Second)
+	case "early-exit":
+		// grok died after creating the session but before system/init named it.
+		fmt.Fprintln(os.Stderr, "Error: connection reset before the session started")
+		os.Exit(1)
 	case "hang":
-		fmt.Printf("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"hang\",\"model\":%q,\"permissionMode\":\"dontAsk\",\"tools\":[]}\n", modelOr(model))
-		fmt.Printf("{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\",\"message\":{\"model\":%q}},\"session_id\":\"hang\"}\n", modelOr(model))
+		id := idOr(args, "hang")
+		fmt.Printf("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":%q,\"model\":%q,\"permissionMode\":\"dontAsk\",\"tools\":[]}\n", id, modelOr(model))
+		fmt.Printf("{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\",\"message\":{\"model\":%q}},\"session_id\":%q}\n", modelOr(model), id)
 		_ = os.Stdout.Sync()
 		time.Sleep(45 * time.Second)
 	case "unsafe":
-		fmt.Printf("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"unsafe\",\"model\":%q,\"permissionMode\":\"dontAsk\",\"tools\":[\"run_terminal_command\"]}\n", modelOr(model))
+		fmt.Printf("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":%q,\"model\":%q,\"permissionMode\":\"dontAsk\",\"tools\":[\"run_terminal_command\"]}\n", idOr(args, "unsafe"), modelOr(model))
 		_ = os.Stdout.Sync()
 		time.Sleep(30 * time.Second)
 	case "no-init":
 		// A result record with no preceding system/init. Stays alive so the server must kill the group.
-		fmt.Println(`{"type":"result","result":"pong","stop_reason":"end_turn","session_id":"abc-def"}`)
+		fmt.Printf("{\"type\":\"result\",\"result\":\"pong\",\"stop_reason\":\"end_turn\",\"session_id\":%q}\n", idOr(args, "abc-def"))
+		_ = os.Stdout.Sync()
+		time.Sleep(30 * time.Second)
+	case "init-image-gen":
+		fmt.Printf("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":%q,\"model\":%q,\"permissionMode\":\"dontAsk\",\"tools\":[\"image_gen\"]}\n", idOr(args, "img"), modelOr(model))
 		_ = os.Stdout.Sync()
 		time.Sleep(30 * time.Second)
 	case "truncated":
 		// Valid init and a text delta, then a cut-off JSON value, then exit.
-		fmt.Printf("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"trunc\",\"model\":%q,\"permissionMode\":\"dontAsk\",\"tools\":[]}\n", modelOr(model))
-		fmt.Printf("{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}},\"session_id\":\"trunc\"}\n")
+		id := idOr(args, "trunc")
+		fmt.Printf("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":%q,\"model\":%q,\"permissionMode\":\"dontAsk\",\"tools\":[]}\n", id, modelOr(model))
+		fmt.Printf("{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}},\"session_id\":%q}\n", id)
 		fmt.Print("{")
 		_ = os.Stdout.Sync()
 	default:
+		if mediaScenario(scenario) {
+			if err := runMedia(scenario, args, body, sid); err != nil {
+				fmt.Fprintf(os.Stderr, "fakegrok media: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
 		path := filepath.Join(fixtureDir(), fixtureName(scenario))
-		replay(path, model, hold)
+		replay(path, model, sid, hold)
 	}
+}
+
+// probeToolsJSON is the init tools array for a toolset probe.
+// FAKEGROK_PROBE_TOOLS overrides a chat probe (--tools todo_write).
+// A media probe uses --tools, unless FAKEGROK_MEDIA_PROBE_TOOLS is set.
+// An empty result is [] so the chat probe still proves an empty tool list.
+func probeToolsJSON(args []string) string {
+	flagTools := flagValue(args, "--tools")
+	if flagTools != "" && flagTools != "todo_write" {
+		if override := os.Getenv("FAKEGROK_MEDIA_PROBE_TOOLS"); override != "" {
+			return override
+		}
+		return toolsJSON(flagTools)
+	}
+	if override := os.Getenv("FAKEGROK_PROBE_TOOLS"); override != "" {
+		return override
+	}
+	return "[]"
+}
+
+// toolsJSON turns a comma-separated tool list into a JSON array.
+// An empty list is []. Names are not escaped beyond encoding/json.
+func toolsJSON(csv string) string {
+	var names []string
+	for _, part := range strings.Split(csv, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			names = append(names, part)
+		}
+	}
+	b, err := json.Marshal(names)
+	if err != nil || len(names) == 0 {
+		return "[]"
+	}
+	return string(b)
 }
 
 // signalIgnore ignores SIGTERM. SIGKILL still ends the process.
@@ -96,27 +149,10 @@ func signalIgnore() {
 	signal.Ignore(syscall.SIGTERM)
 }
 
-// sessions implements `grok sessions delete <id>` without reading stdin.
-// Delete appends the id to FAKEGROK_DELETE_LOG when that path is set.
-func sessions(args []string) {
-	if len(args) >= 2 && args[0] == "delete" {
-		id := args[1]
-		fmt.Printf("Deleted session %s\n", id)
-		if p := os.Getenv("FAKEGROK_DELETE_LOG"); p != "" {
-			f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-			if err == nil {
-				fmt.Fprintln(f, id)
-				_ = f.Close()
-			}
-		}
-		return
-	}
-	fmt.Println("SESSION ID")
-}
-
 // replay writes a fixture to stdout. -m replaces the recorded default model id
-// so the server reports the model grok was asked to run. hold sleeps after message_start.
-func replay(path, model string, hold time.Duration) {
+// so the server reports the model grok was asked to run. A non-empty sid replaces
+// the recorded session ids, as grok echoes --session-id. hold sleeps after message_start.
+func replay(path, model, sid string, hold time.Duration) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fakegrok fixture: %v\n", err)
@@ -125,6 +161,7 @@ func replay(path, model string, hold time.Duration) {
 	if model != "" {
 		b = bytes.ReplaceAll(b, []byte("grok-4.7-build-fast"), []byte(model))
 	}
+	b = withSession(b, sid)
 	if hold <= 0 {
 		_, _ = os.Stdout.Write(b)
 		if !bytes.HasSuffix(b, []byte("\n")) {
@@ -240,12 +277,15 @@ func writeReport(args []string, promptPath, body string) {
 	}
 	_, xai := os.LookupEnv("XAI_API_KEY")
 	rec := map[string]any{
-		"argv":   args,
-		"xai":    xai,
-		"prompt": promptPath,
-		"mode":   mode,
-		"head":   trimHead(body),
-		"body":   body,
+		"argv":           args,
+		"xai":            xai,
+		"prompt":         promptPath,
+		"mode":           mode,
+		"head":           trimHead(body),
+		"body":           body,
+		"pid":            os.Getpid(),
+		"image_parallel": os.Getenv("GROK_MAX_PARALLEL_IMAGE_GEN_CALLS"),
+		"video_parallel": os.Getenv("GROK_MAX_PARALLEL_VIDEO_GEN_CALLS"),
 	}
 	b, err := json.Marshal(rec)
 	if err != nil {

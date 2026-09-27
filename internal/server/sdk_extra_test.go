@@ -119,19 +119,43 @@ func TestAccessLog(t *testing.T) {
 	}
 }
 
-// TestSessionDelete asks fakegrok to delete the session unless -keep-sessions is set.
+// TestSessionDelete checks what runs leave in GROK_HOME. By default the session named
+// in X-Agent-Mock-Session and the startup probe's session are deleted, and grok's
+// prompt_history.jsonl is removed. With -keep-sessions nothing is deleted.
 func TestSessionDelete(t *testing.T) {
 	h := start(t, startOpt{})
-	h.postJSON(`{"model":"m","messages":[{"role":"user","content":"x"}]}`, nil)
-	waitFor(t, 2*time.Second, func() bool {
+	_, hdr, _ := h.postJSON(`{"model":"m","messages":[{"role":"user","content":"x"}]}`, nil)
+	id := hdr.Get("X-Agent-Mock-Session")
+	if len(id) != 36 {
+		t.Fatalf("X-Agent-Mock-Session %q is not the assigned session UUID", id)
+	}
+	waitFor(t, 5*time.Second, func() bool {
 		b, _ := os.ReadFile(h.dir + "/deletes")
-		return strings.TrimSpace(string(b)) != ""
+		return strings.Contains(string(b), id)
 	})
+	if !h.srv.Runner.Wait(t.Context()) {
+		t.Fatal("deletes did not finish")
+	}
+	if dirs := h.sessionDirs(); len(dirs) != 0 {
+		t.Fatal("sessions left:", dirs)
+	}
+	if n := h.historyLines(); n != 0 {
+		t.Fatalf("prompt history kept %d lines", n)
+	}
+
 	hk := start(t, startOpt{keep: true})
-	hk.postJSON(`{"model":"m","messages":[{"role":"user","content":"x"}]}`, nil)
+	_, hdr, _ = hk.postJSON(`{"model":"m","messages":[{"role":"user","content":"x"}]}`, nil)
+	kept := hdr.Get("X-Agent-Mock-Session")
 	time.Sleep(200 * time.Millisecond)
 	b, _ := os.ReadFile(hk.dir + "/deletes")
 	if strings.TrimSpace(string(b)) != "" {
 		t.Fatal(string(b))
+	}
+	dirs := hk.sessionDirs()
+	if len(dirs) != 2 || !strings.HasSuffix(dirs[0], kept) && !strings.HasSuffix(dirs[1], kept) {
+		t.Fatalf("want the probe and %s kept, got %v", kept, dirs)
+	}
+	if n := hk.historyLines(); n != 2 {
+		t.Fatalf("prompt history has %d lines, want probe + request", n)
 	}
 }

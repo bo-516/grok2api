@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"github.com/openai/openai-go/v3/option"
 	"github.com/shaoboli/agent-mock/internal/config"
 	"github.com/shaoboli/agent-mock/internal/grok"
+	"github.com/shaoboli/agent-mock/internal/media"
 )
 
 // fakeBin and agentBin are built once in TestMain.
@@ -89,6 +91,16 @@ type startOpt struct {
 	keep       bool
 	logPrompts bool
 	extra      []string
+	// media turns the image and video routes on and wires a store under dir.
+	media bool
+	// mediaTools is the probed allowlist. Nil with media means all three tools.
+	mediaTools []string
+	// mediaTTL is the file and job TTL. Zero uses one hour.
+	mediaTTL time.Duration
+	// videoTimeout is -video-timeout. Zero uses one minute.
+	videoTimeout time.Duration
+	// maxVideo is -max-video-jobs. Zero uses 2.
+	maxVideo int
 }
 
 // harness is a running server plus its fakegrok files.
@@ -101,6 +113,9 @@ type harness struct {
 }
 
 // start probes fakegrok and serves on a loopback port.
+// Each harness gets its own GROK_HOME and runner Root under t.TempDir(), so the
+// fake's sessions and prompt history, and the runner's cleanup of them, never touch
+// the developer's ~/.grok or the shared $TMPDIR/agent-mock.
 func start(t *testing.T, o startOpt) *harness {
 	t.Helper()
 	if o.scenario == "" {
@@ -122,16 +137,25 @@ func start(t *testing.T, o startOpt) *harness {
 	env := filteredEnv()
 	env = append(env,
 		"XAI_API_KEY=secret",
+		"GROK_HOME="+filepath.Join(dir, "grok-home"),
 		"FAKEGROK_FIXTURE_DIR="+fixDir,
 		"FAKEGROK_SCENARIO="+o.scenario,
 		"FAKEGROK_REPORT="+filepath.Join(dir, "report.jsonl"),
+		"FAKEGROK_CALLS="+filepath.Join(dir, "calls.jsonl"),
 		"FAKEGROK_SEQ="+filepath.Join(dir, "seq"),
 		"FAKEGROK_PIDFILE="+filepath.Join(dir, "pid"),
 		"FAKEGROK_DELETE_LOG="+filepath.Join(dir, "deletes"),
 		"FAKEGROK_LOGIN="+o.login,
 	)
 	env = append(env, o.extra...)
-	runner := &grok.Runner{Bin: fakeBin, KeepSessions: o.keep, Environ: func() []string { return append([]string(nil), env...) }}
+	runner := &grok.Runner{Bin: fakeBin, Root: filepath.Join(dir, "root"), KeepSessions: o.keep, Environ: func() []string { return append([]string(nil), env...) }}
+	// Background session deletes write into dir. Cleanups run last-in first-out, so
+	// this runs after ts.Close and before t.TempDir removes dir.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		runner.Wait(ctx)
+	})
 	p := grok.Probe(t.Context(), fakeBin, runner)
 	if o.login == "ok" && !p.ToolsetEmpty {
 		t.Fatalf("startup toolset: %s", p.ToolsetError)
@@ -144,7 +168,36 @@ func start(t *testing.T, o startOpt) *harness {
 	if cfg.ModelMap == nil {
 		cfg.ModelMap = map[string]string{}
 	}
+	if o.media {
+		cfg.Media = true
+		if o.mediaTTL <= 0 {
+			o.mediaTTL = time.Hour
+		}
+		if o.videoTimeout <= 0 {
+			o.videoTimeout = time.Minute
+		}
+		if o.maxVideo <= 0 {
+			o.maxVideo = 2
+		}
+		cfg.MediaTTL = o.mediaTTL
+		cfg.VideoTimeout = o.videoTimeout
+		cfg.MaxVideoJobs = o.maxVideo
+	}
 	srv := New(cfg, runner)
+	if o.media {
+		st, err := media.NewStore(filepath.Join(dir, "media"), o.mediaTTL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv.Store = st
+		srv.Stager = &media.Stager{Root: filepath.Join(runner.RootDir(), "mcwd"), Store: st}
+		srv.Jobs = media.NewJobs(o.maxVideo, o.mediaTTL)
+		if o.mediaTools == nil {
+			srv.MediaTools = []string{"image_gen", "image_edit", "reference_to_video"}
+		} else {
+			srv.MediaTools = o.mediaTools
+		}
+	}
 	for _, m := range p.Models {
 		srv.Known = append(srv.Known, m.ID)
 	}
@@ -180,12 +233,15 @@ func (h *harness) completions() *openai.ChatCompletionService {
 
 // report is one fakegrok invocation record.
 type report struct {
-	Argv   []string `json:"argv"`
-	XAI    bool     `json:"xai"`
-	Prompt string   `json:"prompt"`
-	Mode   int      `json:"mode"`
-	Head   string   `json:"head"`
-	Body   string   `json:"body"`
+	Argv          []string `json:"argv"`
+	XAI           bool     `json:"xai"`
+	Prompt        string   `json:"prompt"`
+	Mode          int      `json:"mode"`
+	Head          string   `json:"head"`
+	Body          string   `json:"body"`
+	PID           int      `json:"pid"`
+	ImageParallel string   `json:"image_parallel"`
+	VideoParallel string   `json:"video_parallel"`
 }
 
 // userReports returns prompt runs that are not the startup toolset probe.
@@ -211,12 +267,42 @@ func (h *harness) userReports() []report {
 	return out
 }
 
-// filteredEnv drops XAI_API_KEY and FAKEGROK_* so a test starts from a clean parent.
+// sessionDirs lists the session directories fakegrok left under this harness's
+// GROK_HOME, in any group. An empty list means every session was deleted.
+func (h *harness) sessionDirs() []string {
+	h.t.Helper()
+	dirs, err := filepath.Glob(filepath.Join(h.dir, "grok-home", "sessions", "*", "*-*-*-*-*"))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return dirs
+}
+
+// historyLines counts prompt_history.jsonl lines under this harness's GROK_HOME.
+// Zero means no history file is left.
+func (h *harness) historyLines() int {
+	h.t.Helper()
+	files, err := filepath.Glob(filepath.Join(h.dir, "grok-home", "sessions", "*", grok.PromptHistoryFile))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	n := 0
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		n += bytes.Count(b, []byte("\n"))
+	}
+	return n
+}
+
+// filteredEnv drops XAI_API_KEY, GROK_HOME, and FAKEGROK_* so a test starts from a clean parent.
 func filteredEnv() []string {
 	var out []string
 	for _, kv := range os.Environ() {
 		key, _, _ := strings.Cut(kv, "=")
-		if key == "XAI_API_KEY" || strings.HasPrefix(key, "FAKEGROK_") {
+		if key == "XAI_API_KEY" || key == "GROK_HOME" || strings.HasPrefix(key, "FAKEGROK_") {
 			continue
 		}
 		out = append(out, kv)

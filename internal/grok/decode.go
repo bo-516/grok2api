@@ -78,11 +78,20 @@ type Events struct {
 	OnMessageStart func(sessionID, model string) error
 	// OnText is called with each text delta. Thinking deltas are not forwarded.
 	OnText func(delta string) error
+	// OnToolUse is called once per tool call, when its input JSON is complete.
+	// A partial-stream tool_use and the same id on the later assistant line
+	// produce one call. Nil skips the event. Returning ErrStop stops the run
+	// as success. Any other error stops Decode and the runner kills the group.
+	OnToolUse func(ToolUse) error
+	// OnToolResult is called for each tool_result on a user line.
+	// Nil skips it. ErrStop and other errors behave like OnToolUse.
+	OnToolResult func(ToolResult) error
 }
 
-// errStop is returned by the runner's OnInit when StopAfterInit is set.
-// Decode treats it as a clean stop. It is not a client-facing error.
-var errStop = errors.New("stop after init")
+// ErrStop tells the runner to SIGKILL the process group and return the Final
+// with a nil error. Media guards return it once every planned output is stored.
+// It is not a client-facing error.
+var ErrStop = errors.New("grok: stop run")
 
 // Decode reads NDJSON or one JSON value from r until a terminal record or EOF.
 // Pretty-printed text.json and line-delimited streaming-messages-json both work
@@ -110,8 +119,8 @@ func Decode(r io.Reader, ev Events) (Final, error) {
 			return out, &Error{Code: CodeBadOutput, Message: "grok output could not be parsed", SessionID: out.SessionID, Err: err}
 		}
 		if err := st.consume(raw); err != nil {
-			if errors.Is(err, errStop) {
-				return st.finish(), errStop
+			if errors.Is(err, ErrStop) {
+				return st.finish(), ErrStop
 			}
 			if ge, ok := AsError(err); ok {
 				if ge.SessionID == "" {
@@ -177,9 +186,14 @@ type decoder struct {
 	terminal bool
 	// failed is a classified error from an error record.
 	failed *Error
+	// toolByIndex collects a partial-stream tool_use until content_block_stop.
+	toolByIndex map[int]*toolBuild
+	// toolSeen is the set of tool_use ids already given to OnToolUse.
+	// The assistant line repeats ids that the partial stream already emitted.
+	toolSeen map[string]bool
 }
 
-// consume handles one JSON value. It returns errStop, a *Error, or a callback error.
+// consume handles one JSON value. It returns ErrStop, a *Error, or a callback error.
 func (d *decoder) consume(raw json.RawMessage) error {
 	d.sawAny = true
 	var m map[string]json.RawMessage
@@ -203,7 +217,12 @@ func (d *decoder) consume(raw json.RawMessage) error {
 			return err
 		}
 		d.onAssistant(m)
-		return nil
+		return d.emitAssistantTools(m)
+	case "user":
+		if err := d.missingInit(); err != nil {
+			return err
+		}
+		return d.onToolUser(m)
 	case "result":
 		if err := d.missingInit(); err != nil {
 			return err
@@ -270,14 +289,12 @@ func (d *decoder) onEvent(m map[string]json.RawMessage) error {
 		_ = json.Unmarshal(raw, &ev)
 	}
 	switch jsonString(ev, "type") {
-	case "message_start":
-		if msg := nestedMap(ev, "message"); msg != nil {
-			d.noteModel(jsonString(msg, "model"))
-		}
-		if d.ev.OnMessageStart != nil {
-			return d.ev.OnMessageStart(d.sessionID, d.model)
-		}
+	case "content_block_start":
+		d.noteToolStart(ev)
 	case "content_block_delta":
+		if d.consumeToolDelta(ev) {
+			return nil
+		}
 		delta := nestedMap(ev, "delta")
 		if jsonString(delta, "type") == "text_delta" {
 			piece := jsonString(delta, "text")
@@ -287,6 +304,17 @@ func (d *decoder) onEvent(m map[string]json.RawMessage) error {
 					return d.ev.OnText(piece)
 				}
 			}
+		}
+	case "content_block_stop":
+		if err := d.finishTool(ev); err != nil {
+			return err
+		}
+	case "message_start":
+		if msg := nestedMap(ev, "message"); msg != nil {
+			d.noteModel(jsonString(msg, "model"))
+		}
+		if d.ev.OnMessageStart != nil {
+			return d.ev.OnMessageStart(d.sessionID, d.model)
 		}
 	case "message_delta":
 		if delta := nestedMap(ev, "delta"); delta != nil {
@@ -339,7 +367,12 @@ func (d *decoder) onResult(m map[string]json.RawMessage) error {
 	d.usage = mergeUsage(d.usage, m["usage"])
 	d.noteModelUsage(m["modelUsage"])
 	d.terminal = true
-	if jsonBool(m, "is_error") || strings.Contains(jsonString(m, "subtype"), "error") {
+	sub := jsonString(m, "subtype")
+	if sub == "error_max_turns" || strings.Contains(sub, "error_max_turns") {
+		d.failed = &Error{Code: CodeMaxTurns, Message: "grok stopped at --max-turns before the media job finished", SessionID: d.sessionID}
+		return nil
+	}
+	if jsonBool(m, "is_error") || strings.Contains(sub, "error") {
 		d.failed = Classify(firstError(m), "")
 		d.failed.SessionID = d.sessionID
 		return nil
@@ -365,54 +398,5 @@ func (d *decoder) onBare(m map[string]json.RawMessage) {
 	d.noteModelUsage(m["modelUsage"])
 	if jsonString(m, "type") == "error" || jsonBool(m, "is_error") {
 		d.failed = Classify(jsonString(m, "message"), "")
-	}
-}
-
-// finish builds the Final from accumulated fields.
-func (d *decoder) finish() Final {
-	text := d.text.String()
-	if text == "" {
-		text = d.resultText
-	}
-	if text == "" {
-		text = d.fallback
-	}
-	return Final{
-		Text:       text,
-		Structured: d.structured,
-		StopReason: d.stopReason,
-		SessionID:  d.sessionID,
-		Model:      d.model,
-		Usage:      d.usage,
-	}
-}
-
-// noteSession keeps the first non-empty session id, then replaces an empty one only.
-func (d *decoder) noteSession(id string) {
-	if id != "" {
-		d.sessionID = id
-	}
-}
-
-// noteModel ignores blank and "unknown", which a logged-out init uses as a placeholder.
-func (d *decoder) noteModel(model string) {
-	if model != "" && model != "unknown" {
-		d.model = model
-	}
-}
-
-// noteModelUsage reads the single key of modelUsage as the model id.
-func (d *decoder) noteModelUsage(raw json.RawMessage) {
-	if len(raw) == 0 {
-		return
-	}
-	var models map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &models); err != nil {
-		return
-	}
-	if len(models) == 1 {
-		for name := range models {
-			d.noteModel(name)
-		}
 	}
 }

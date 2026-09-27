@@ -12,10 +12,14 @@ import (
 
 	"github.com/shaoboli/agent-mock/internal/config"
 	"github.com/shaoboli/agent-mock/internal/grok"
+	"github.com/shaoboli/agent-mock/internal/media"
 )
 
-// maxBody is the largest accepted request body. Bigger bodies are 413.
+// maxBody is the largest accepted chat body. Bigger bodies are 413.
 const maxBody = 8 << 20
+
+// maxMediaBody is the largest accepted image or video body. Bigger bodies are 413.
+const maxMediaBody = 64 << 20
 
 // logKey is the context key for the per-request access record.
 type logKey struct{}
@@ -38,6 +42,19 @@ type logRec struct {
 	note string
 	// chat marks a /v1/chat/completions request so the log line uses the chat shape.
 	chat bool
+	// media marks an image or video request. The log line then carries kind,
+	// tools, n, and files instead of the chat model field.
+	media bool
+	// kind is image or video. It is empty on a chat request.
+	kind string
+	// mediaTools is the allowlist joined with commas, such as image_gen.
+	mediaTools string
+	// n is the image count, or 1 for a video. Zero until the body is parsed.
+	n int
+	// files is how many outputs were stored. Zero on failure.
+	files int
+	// job is the video request id when the line should name it.
+	job string
 }
 
 // Server is the HTTP API. Runner executes grok. Known is the model list from startup.
@@ -61,6 +78,16 @@ type Server struct {
 	Log io.Writer
 	// Now is the clock for the created field. Nil uses time.Now.
 	Now func() time.Time
+	// Store holds generated files. Nil makes media routes 404 after the flag check.
+	Store *media.Store
+	// Stager writes edit and video inputs under the media cwd. Nil rejects edits.
+	Stager *media.Stager
+	// Jobs is the video table. Nil makes video routes fail closed.
+	Jobs *media.Jobs
+	// MediaTools is what the startup probe offered. Nil means the caller did not
+	// probe and every media tool is allowed. An empty non-nil slice means none
+	// are available, so those routes return 403 without starting grok.
+	MediaTools []string
 
 	lim *limiter
 }
@@ -80,6 +107,11 @@ func New(cfg config.Config, runner *grok.Runner) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", s.chat)
+	mux.HandleFunc("POST /v1/images/generations", s.imageGenerate)
+	mux.HandleFunc("POST /v1/images/edits", s.imageEdit)
+	mux.HandleFunc("POST /v1/videos/generations", s.videoGenerate)
+	mux.HandleFunc("GET /v1/videos/{request_id}", s.videoStatus)
+	mux.HandleFunc("GET /v1/media/{name}", s.mediaFile)
 	mux.HandleFunc("GET /v1/models", s.models)
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /doc", s.doc)
@@ -94,7 +126,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && r.URL.Path == "/doc" {
+		if r.Method == http.MethodGet && (r.URL.Path == "/doc" || strings.HasPrefix(r.URL.Path, "/v1/media/")) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -144,6 +176,29 @@ func (s *Server) writeLog(r *http.Request, rec *logRec, dur time.Duration) {
 	if s.Log == nil {
 		return
 	}
+	if rec.media {
+		tools := rec.mediaTools
+		if tools == "" {
+			tools = "-"
+		}
+		kind := rec.kind
+		if kind == "" {
+			kind = "media"
+		}
+		line := fmt.Sprintf("%s %s %s kind=%s tools=%s n=%d status=%d dur=%.1fs in=%d out=%d files=%d",
+			time.Now().Format("15:04:05"), r.Method, r.URL.Path, kind, tools, rec.n, rec.status, dur.Seconds(), rec.inTok, rec.outTok, rec.files)
+		if rec.job != "" {
+			line += " job=" + rec.job
+		}
+		if rec.note != "" {
+			line += " " + rec.note
+		}
+		if rec.prompt != "" {
+			line += " prompt=" + fmt.Sprintf("%q", strings.ReplaceAll(rec.prompt, "\n", " "))
+		}
+		fmt.Fprintln(s.Log, line)
+		return
+	}
 	model := "-"
 	if rec.chat {
 		reqModel := rec.reqModel
@@ -182,13 +237,46 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	if login == "" {
 		login = "not_logged_in"
 	}
+	q, running := 0, 0
+	if s.Jobs != nil {
+		q, running = s.Jobs.Counts()
+	}
+	tools := []string{}
+	if s.Config.Media && s.MediaTools != nil {
+		tools = s.MediaTools
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":          "ok",
 		"grok":            s.GrokVersion,
 		"login":           login,
 		"inflight":        s.lim.Inflight(),
 		"max_concurrency": s.Config.MaxConcurrency,
+		"media":           s.mediaHealth(),
+		"media_tools":     tools,
+		"video_jobs":      map[string]int{"queued": q, "running": running},
 	})
+}
+
+// mediaHealth is ok when every media tool was offered, partial when some are
+// missing, and off when -media is false. A nil MediaTools with media enabled
+// is ok: the process did not probe, which tests use when they allow every tool.
+func (s *Server) mediaHealth() string {
+	if !s.Config.Media {
+		return "off"
+	}
+	if s.MediaTools == nil {
+		return "ok"
+	}
+	have := map[string]bool{}
+	for _, t := range s.MediaTools {
+		have[t] = true
+	}
+	for _, t := range []string{"image_gen", "image_edit", "reference_to_video"} {
+		if !have[t] {
+			return "partial"
+		}
+	}
+	return "ok"
 }
 
 // models lists superllm first, then grok models (owned_by xai) and -model-map aliases (owned_by agent-mock-alias).

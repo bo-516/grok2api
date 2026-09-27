@@ -90,8 +90,12 @@ func grokStatus(code string) (int, string) {
 		return http.StatusUnauthorized, "authentication_error"
 	case grok.CodeRateLimited, grok.CodeUsageLimit:
 		return http.StatusTooManyRequests, "rate_limit_error"
-	case grok.CodeNotFound, grok.CodeUnsafe:
+	case grok.CodeNotFound, grok.CodeUnsafe, grok.CodeUnsafeInput:
 		return http.StatusInternalServerError, "server_error"
+	case grok.CodeMediaUnavailable:
+		return http.StatusForbidden, "permission_error"
+	case grok.CodeContentPolicy:
+		return http.StatusBadRequest, "invalid_request_error"
 	case grok.CodeModelNotFound:
 		return http.StatusBadRequest, "invalid_request_error"
 	case grok.CodeTimeout:

@@ -2,6 +2,7 @@ package grok
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 )
 
@@ -22,9 +23,33 @@ type RunSpec struct {
 	// The streaming output format stays streaming-messages-json; grok 1.0.41 still
 	// emits NDJSON when that format is set explicitly next to --json-schema.
 	JSONSchema json.RawMessage
-	// StopAfterInit kills the process once system/init shows tools:[].
-	// Startup uses this so the toolset check does not wait for a full completion.
+	// StopAfterInit kills the process once system/init has been checked.
+	// Startup probes use this so the toolset check does not wait for a completion.
+	// A probe rejects tools outside Tools and reports missing allowlist entries
+	// to the caller instead of failing the run.
 	StopAfterInit bool
+	// Tools is the exact tool allowlist. Nil or empty means a chat run: argv still
+	// passes --tools todo_write and disallows it, which is what yields tools:[].
+	// A non-empty list is passed as --tools and the init record must match it.
+	Tools []string
+	// MaxTurns is --max-turns. Zero means 1, the chat value. A media plan sets 2
+	// (the tool round plus the closing reply) or 3 for text-to-video.
+	MaxTurns int
+	// Cwd replaces the shared empty chat directory when set. Media runs pass mcwd.
+	// Empty keeps <Root>/cwd. The runner creates the directory at 0700.
+	Cwd string
+	// ExtraEnv is appended after ChildEnv. Media sets the parallel image or video
+	// call caps. XAI_API_KEY in this list is dropped so it cannot undo ChildEnv.
+	ExtraEnv []string
+	// PermissionMode is --permission-mode when Tools is non-empty.
+	// Empty still uses dontAsk. Chat ignores this field and always passes dontAsk.
+	// Media plans set bypassPermissions because dontAsk cancels image_gen on grok 1.0.41.
+	PermissionMode string
+	// SessionID is passed as --session-id, a UUID grok uses for the new session
+	// instead of generating one. Runner.Run fills it with NewSessionID when empty,
+	// so agent-mock can delete the session even if grok dies before printing its id.
+	// A value that is not a fresh UUID makes grok exit with an error.
+	SessionID string
 }
 
 // ProbePrompt is the prompt-file body of the startup toolset probe.
@@ -32,25 +57,43 @@ type RunSpec struct {
 // at that line, so the text is never a user request.
 const ProbePrompt = "agent-mock-toolset-probe\n"
 
-// CommandArgs returns argv for a restricted grok run, not including argv0.
+// CommandArgs returns argv for one grok run, not including argv0.
 // promptFile and cwd must be absolute paths the caller created.
-// The set forces an empty tool list: --tools todo_write is then removed by
-// --disallowed-tools, which is the combination grok 1.0.41 actually honors
-// (--tools "" leaves the default tools in place). permission-mode is only dontAsk.
-// A wrong cwd would let grok read the developer's repo, so cwd is required.
+// When spec.Tools is empty the set forces an empty tool list: --tools todo_write
+// is then removed by --disallowed-tools, which is the combination grok 1.0.41
+// actually honors (--tools "" leaves the default tools in place). Chat
+// permission-mode stays dontAsk and --max-turns stays 1.
+// When spec.Tools is set, --tools is that allowlist and --disallowed-tools is
+// only search_tool,use_tool so the media tools survive. A wrong cwd would let
+// grok read the developer's repo, so cwd is required.
+// spec.SessionID adds --session-id; empty leaves the id to grok.
 func CommandArgs(promptFile, cwd string, spec RunSpec) []string {
+	turns := spec.MaxTurns
+	if turns <= 0 {
+		turns = 1
+	}
+	tools := "todo_write"
+	disallowed := "search_tool,use_tool,todo_write"
+	perm := "dontAsk"
+	if len(spec.Tools) > 0 {
+		tools = strings.Join(spec.Tools, ",")
+		disallowed = "search_tool,use_tool"
+		if spec.PermissionMode != "" {
+			perm = spec.PermissionMode
+		}
+	}
 	args := []string{
 		"--prompt-file", promptFile,
 		"--verbatim",
 		"--output-format", "streaming-messages-json",
 		"--include-partial-messages",
-		"--max-turns", "1",
+		"--max-turns", strconv.Itoa(turns),
 		"--no-subagents",
 		"--no-plan",
 		"--disable-web-search",
-		"--tools", "todo_write",
-		"--disallowed-tools", "search_tool,use_tool,todo_write",
-		"--permission-mode", "dontAsk",
+		"--tools", tools,
+		"--disallowed-tools", disallowed,
+		"--permission-mode", perm,
 		"--cwd", cwd,
 	}
 	if spec.SystemOverride != "" {
@@ -64,6 +107,9 @@ func CommandArgs(promptFile, cwd string, spec RunSpec) []string {
 	}
 	if len(spec.JSONSchema) > 0 {
 		args = append(args, "--json-schema", string(spec.JSONSchema))
+	}
+	if spec.SessionID != "" {
+		args = append(args, "--session-id", spec.SessionID)
 	}
 	return args
 }

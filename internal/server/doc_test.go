@@ -65,6 +65,43 @@ func TestDocHidesKeyFromRemoteClients(t *testing.T) {
 	}
 }
 
+// TestDocMediaShowsHowToGenerate checks /doc includes a copy-paste image body,
+// the video submit and poll shape, and the limits callers hit first.
+// The whole guide must stay free of the backing runtime's name.
+func TestDocMediaShowsHowToGenerate(t *testing.T) {
+	srv := New(config.Config{}, nil)
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/doc", nil)
+	req.Host = "127.0.0.1:8787"
+	req.RemoteAddr = "127.0.0.1:9"
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if rec.Code != 200 {
+		t.Fatal(rec.Code, body)
+	}
+	for _, want := range []string{
+		"POST http://127.0.0.1:8787/v1/images/generations",
+		"POST http://127.0.0.1:8787/v1/images/edits",
+		"POST http://127.0.0.1:8787/v1/videos/generations",
+		"GET http://127.0.0.1:8787/v1/videos/<request_id>",
+		`"duration":6`,
+		`"status":"done"`,
+		`"status":"pending"`,
+		"reference_images",
+		"1 到 4",
+		"20 MiB",
+		"media_disabled",
+		"第 6、7 节",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %q\n%s", want, body)
+		}
+	}
+	if strings.Contains(strings.ToLower(body), "grok") {
+		t.Fatal(body)
+	}
+}
+
 // TestDocDefaultKeyUsesDev when no API key is configured, including for a remote peer.
 func TestDocDefaultKeyUsesDev(t *testing.T) {
 	srv := New(config.Config{}, nil)

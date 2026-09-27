@@ -46,6 +46,21 @@ func (l *limiter) Acquire(ctx context.Context) error {
 	}
 }
 
+// AcquireUntil waits for a slot until ctx ends. It does not apply -queue-timeout.
+// Video jobs use it so a queued video is bounded by -video-timeout instead of
+// the chat queue. A successful call must be matched with Release.
+// ctx.Err() is returned when the deadline passes first, and the caller maps
+// that to a failed video job.
+func (l *limiter) AcquireUntil(ctx context.Context) error {
+	select {
+	case l.slots <- struct{}{}:
+		l.inflight.Add(1)
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Release returns a slot. Calling it without Acquire panics on the receive
 // only if the buffer is empty, which means the handler double-released.
 func (l *limiter) Release() {

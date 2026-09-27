@@ -19,12 +19,16 @@ import (
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/shared"
+	"github.com/shaoboli/agent-mock/internal/grok"
 )
 
 // callID matches the tool-call ids agent-mock generates.
 var callID = regexp.MustCompile(`^call_[A-Za-z0-9]{24}$`)
 
 // TestLive is the real-grok acceptance path. It is skipped unless AGENT_MOCK_LIVE=1.
+// Each server runs with its own TMPDIR, so its grok session group is separate from
+// the one a developer's agent-mock uses, and everything a server leaves in ~/.grok
+// (including the -keep-sessions server's sessions) is removed when the test ends.
 func TestLive(t *testing.T) {
 	if os.Getenv("AGENT_MOCK_LIVE") != "1" {
 		t.Skip("set AGENT_MOCK_LIVE=1")
@@ -48,24 +52,50 @@ func TestLive(t *testing.T) {
 		if id == "" {
 			t.Fatal("empty session")
 		}
-		waitUntil(t, 20*time.Second, func() bool { return !sessionListed(t, id) })
+		waitUntil(t, 20*time.Second, func() bool { return !sessionListed(t, srv.cwd, id) })
+	}
+	if n := historyLines(t, srv.group); n != 0 {
+		t.Fatalf("grok's prompt_history.jsonl kept %d caller prompts", n)
 	}
 
 	kept := startServer(t, ctx, []string{"-keep-sessions"})
 	keptClient := openai.NewClient(option.WithBaseURL(kept.base), option.WithAPIKey("dev"), option.WithMaxRetries(0))
 	keptID := sessionOf(t, mustText(t, ctx, keptClient))
-	waitUntil(t, 15*time.Second, func() bool { return sessionListed(t, keptID) })
+	waitUntil(t, 15*time.Second, func() bool { return sessionListed(t, kept.cwd, keptID) })
+	if historyLines(t, kept.group) == 0 {
+		t.Fatal("-keep-sessions must leave grok's prompt history alone")
+	}
 }
 
+// running is one agent-mock process started by startServer.
 type running struct {
-	base   string
+	// base is the OpenAI base URL, including /v1.
+	base string
+	// banner is the startup text printed to stderr.
 	banner string
-	cmd    *exec.Cmd
+	// cmd is the agent-mock process.
+	cmd *exec.Cmd
+	// cwd is the empty directory this server runs grok in, under its own TMPDIR.
+	cwd string
+	// group is grok's session group for cwd in ~/.grok/sessions.
+	group string
 }
 
-// startServer launches the real agent-mock binary and waits for the startup banner.
+// startServer launches the real agent-mock binary with its own TMPDIR and waits for
+// the startup banner. When the test ends the server is stopped first, then every
+// session it left is deleted and its prompt history and session group are removed.
 func startServer(t *testing.T, ctx context.Context, extra []string) *running {
 	t.Helper()
+	tmp := t.TempDir()
+	cwd := filepath.Join(tmp, "agent-mock", "cwd")
+	if err := os.MkdirAll(cwd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	group, ok := grok.SessionGroup(grok.GrokHome(os.Environ()), cwd)
+	if !ok {
+		t.Fatal("cannot locate grok's session group for", cwd)
+	}
+	t.Cleanup(func() { removeGroup(t, group) })
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -75,6 +105,7 @@ func startServer(t *testing.T, ctx context.Context, extra []string) *running {
 	bin := buildBinary(t)
 	args := append([]string{"-addr", addr, "-grok-bin", "grok"}, extra...)
 	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = append(os.Environ(), "TMPDIR="+tmp)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -108,7 +139,7 @@ func startServer(t *testing.T, ctx context.Context, extra []string) *running {
 	}()
 	select {
 	case banner := <-ready:
-		return &running{base: "http://" + addr + "/v1", banner: banner, cmd: cmd}
+		return &running{base: "http://" + addr + "/v1", banner: banner, cmd: cmd, cwd: cwd, group: group}
 	case <-time.After(15 * time.Second):
 		t.Fatal("startup banner was not ready within 15s")
 	}
@@ -261,19 +292,62 @@ func sessionFromID(id string) string {
 	return raw[0:8] + "-" + raw[8:12] + "-" + raw[12:16] + "-" + raw[16:20] + "-" + raw[20:32]
 }
 
-// sessionListed reports whether grok's session list for the shared empty cwd still shows id.
-// `grok sessions list` without --cwd only shows the caller's directory, so headless runs
-// in agent-mock's fixed cwd are invisible unless --cwd points there. Q-3 showed delete
-// itself is non-interactive; the list must use the same directory the runs used.
-func sessionListed(t *testing.T, id string) bool {
+// sessionListed reports whether grok's session list for cwd, the server's empty run
+// directory, still shows id. `grok sessions list` without --cwd only shows the caller's
+// directory, so headless runs in agent-mock's cwd are invisible unless --cwd points
+// there. Q-3 showed delete itself is non-interactive; the list must use the same
+// directory the runs used.
+func sessionListed(t *testing.T, cwd, id string) bool {
 	t.Helper()
-	cwd := filepath.Join(os.TempDir(), "agent-mock", "cwd")
 	cmd := exec.Command("grok", "--cwd", cwd, "sessions", "list", "-n", "50")
 	b, err := cmd.Output()
 	if err != nil {
 		t.Fatal(err, string(b))
 	}
 	return strings.Contains(string(b), id)
+}
+
+// historyLines counts the lines of grok's prompt_history.jsonl in group; 0 when the
+// file does not exist. Only the count is read, never the prompts.
+func historyLines(t *testing.T, group string) int {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(group, grok.PromptHistoryFile))
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Count(string(b), "\n")
+}
+
+// removeGroup deletes everything a test server left in group, so a live run leaves
+// nothing in ~/.grok, not even the -keep-sessions server's sessions: each session
+// directory goes through `grok sessions delete`, then prompt_history.jsonl and the
+// empty group directory are removed. It runs after the server has stopped.
+func removeGroup(t *testing.T, group string) {
+	entries, err := os.ReadDir(group)
+	if os.IsNotExist(err) {
+		return
+	}
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if err := grok.DeleteSession("grok", e.Name(), os.Environ()); err != nil {
+			t.Error(err)
+		}
+	}
+	if err := grok.RemovePromptHistory(group); err != nil {
+		t.Error(err)
+	}
+	if err := os.Remove(group); err != nil {
+		t.Error("session group not empty after cleanup:", err)
+	}
 }
 
 // waitUntil polls until ok is true or the deadline passes.

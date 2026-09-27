@@ -5,8 +5,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -21,27 +21,38 @@ import (
 // Past this the process group is killed and the client gets grok_failed.
 const initWait = 20 * time.Second
 
-// killGrace is the delay between SIGTERM and SIGKILL of a grok process group.
-const killGrace = 5 * time.Second
-
 // stderrLimit is how much stderr is kept for error messages.
 const stderrLimit = 4 * 1024
 
-// Runner owns prompt files, the fixed empty cwd, and in-flight grok process groups.
-// Close SIGTERMs every group so a SIGINT can finish within 10 seconds.
+// Runner owns prompt files, the fixed empty cwd, in-flight grok process groups, and
+// the cleanup of what grok leaves on disk: the session and the prompt-history line.
+// Close SIGTERMs every group so a SIGINT can finish within 10 seconds; Wait then lets
+// background session deletes finish. The zero value is ready to use.
 type Runner struct {
 	// Bin is the grok executable. Empty means "grok" on PATH.
 	Bin string
-	// Root is the parent of cwd/ and prompts/. Empty uses os.TempDir()/agent-mock.
+	// Root is the parent of cwd/, prompts/, and pending/. Empty uses os.TempDir()/agent-mock.
 	Root string
-	// KeepSessions skips `grok sessions delete` after a run.
+	// KeepSessions turns all cleanup off: no `grok sessions delete`, no pending
+	// records, and grok's prompt_history.jsonl stays. False deletes each session
+	// after its run and removes the prompt history.
 	KeepSessions bool
 	// Environ, when set, supplies the parent environment. Nil uses os.Environ.
-	// Tests pass a slice that includes XAI_API_KEY and FAKEGROK_* variables.
+	// Tests pass a slice that includes XAI_API_KEY, GROK_HOME, and FAKEGROK_* variables.
+	// GROK_HOME and HOME in it also decide where prompt_history.jsonl is removed.
 	Environ func() []string
+	// Log receives one line per cleanup problem, such as a session grok did not
+	// delete. Nil discards the lines. It is never given prompt text.
+	Log io.Writer
 
-	mu     sync.Mutex
+	// mu guards active.
+	mu sync.Mutex
+	// active holds the pids of running grok process-group leaders.
 	active map[int]struct{}
+	// logMu keeps concurrent Log lines whole.
+	logMu sync.Mutex
+	// deletes counts background `grok sessions delete` calls for Wait.
+	deletes tracker
 }
 
 // Run executes one restricted grok process.
@@ -50,12 +61,13 @@ type Runner struct {
 // A cancelled ctx or a deadline SIGTERMs the process group and SIGKILLs it after 5s.
 // DeadlineExceeded becomes CodeTimeout. A bare cancel is returned as ctx.Err()
 // so a disconnected client is not reported as a timeout.
+// An empty spec.SessionID gets a fresh UUID, so the session can be deleted even when
+// grok dies before printing its id. Final.SessionID falls back to that id.
+// Unless KeepSessions is set, the session is deleted in the background after grok
+// exits and prompt_history.jsonl is removed; see cleanup.
 func (r *Runner) Run(ctx context.Context, spec RunSpec, ev Events) (Final, error) {
-	bin := r.Bin
-	if bin == "" {
-		bin = "grok"
-	}
-	cwd, err := r.cwd()
+	bin := r.bin()
+	cwd, err := r.workDir(spec.Cwd)
 	if err != nil {
 		return Final{}, Failed("", err)
 	}
@@ -64,25 +76,33 @@ func (r *Runner) Run(ctx context.Context, spec RunSpec, ev Events) (Final, error
 		return Final{}, Failed("", err)
 	}
 	defer os.Remove(promptPath)
+	if spec.SessionID == "" {
+		spec.SessionID = NewSessionID()
+	}
+	if !r.KeepSessions {
+		if err := r.markPending(spec.SessionID, cwd); err != nil {
+			r.logf("agent-mock: could not record pending grok session %s: %v", spec.SessionID, err)
+		}
+	}
 
 	args := CommandArgs(promptPath, cwd, spec)
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = cwd
-	parent := os.Environ()
-	if r.Environ != nil {
-		parent = r.Environ()
-	}
-	cmd.Env = ChildEnv(parent)
+	cmd.Env = append(ChildEnv(r.environ()), stripSecretEnv(spec.ExtraEnv)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		r.unmarkPending(spec.SessionID)
 		return Final{}, Failed("", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		r.unmarkPending(spec.SessionID)
 		return Final{}, Failed("", err)
 	}
 	if err := cmd.Start(); err != nil {
+		// grok never ran, so there is no session to delete.
+		r.unmarkPending(spec.SessionID)
 		if errors.Is(err, exec.ErrNotFound) || os.IsNotExist(err) {
 			return Final{}, &Error{Code: CodeNotFound, Message: "grok executable not found (" + bin + "). Install Grok Build and run `grok login`.", Err: err}
 		}
@@ -123,27 +143,40 @@ func (r *Runner) Run(ctx context.Context, spec RunSpec, ev Events) (Final, error
 	userInit := ev.OnInit
 	ev.OnInit = func(info Init) error {
 		mark()
-		if !ToolsEmpty(info.ToolsRaw) {
+		extra, missing, cerr := CheckToolset(info.ToolsRaw, spec.Tools)
+		if userInit != nil && cerr == nil {
+			if err := userInit(info); err != nil {
+				_ = signalGroup(pid, syscall.SIGKILL)
+				return err
+			}
+		}
+		if cerr != nil || len(extra) > 0 {
 			_ = signalGroup(pid, syscall.SIGKILL)
 			shown := string(bytes.TrimSpace(info.ToolsRaw))
 			if shown == "" {
 				shown = "missing"
 			}
-			return &Error{Code: CodeUnsafe, Message: "grok toolset was " + shown + ", want []. The process was killed.", SessionID: info.SessionID}
-		}
-		if userInit != nil {
-			if err := userInit(info); err != nil {
-				return err
+			want := "[]"
+			if len(spec.Tools) > 0 {
+				b, _ := json.Marshal(spec.Tools)
+				want = string(b)
 			}
+			return &Error{Code: CodeUnsafe, Message: "grok toolset was " + shown + ", want " + want + ". The process was killed.", SessionID: info.SessionID}
+		}
+		if len(missing) > 0 && !spec.StopAfterInit {
+			_ = signalGroup(pid, syscall.SIGKILL)
+			return &Error{Code: CodeMediaUnavailable, Message: "grok media toolset is missing " + strings.Join(missing, ",") + ". The process was killed.", SessionID: info.SessionID}
 		}
 		if spec.StopAfterInit {
 			_ = signalGroup(pid, syscall.SIGKILL)
-			return errStop
+			return ErrStop
 		}
 		return nil
 	}
 	ev.OnMessageStart = wrapMark(ev.OnMessageStart, mark)
 	ev.OnText = wrapText(ev.OnText, mark)
+	ev.OnToolUse = wrapTool(ev.OnToolUse, mark, pid)
+	ev.OnToolResult = wrapTool(ev.OnToolResult, mark, pid)
 
 	final, decErr := Decode(stdout, ev)
 	mark()
@@ -159,33 +192,36 @@ func (r *Runner) Run(ctx context.Context, spec RunSpec, ev Events) (Final, error
 	stderrWG.Wait()
 	stderrText := tail.String()
 
-	if errors.Is(decErr, errStop) {
-		r.cleanup(final.SessionID)
+	// grok has exited, so its session directory and prompt-history line are final.
+	// The assigned id also covers runs that died before grok printed any id.
+	r.cleanup(cwd, spec.SessionID, final.SessionID, errSessionID(decErr))
+	usable := finalOK(final, decErr)
+	final.SessionID = firstID(final.SessionID, spec.SessionID)
+
+	if errors.Is(decErr, ErrStop) {
 		return final, nil
 	}
 	if ge, ok := AsError(decErr); ok && ge.Code == CodeUnsafe {
-		r.cleanup(ge.SessionID)
+		ge.SessionID = firstID(ge.SessionID, final.SessionID)
 		return final, ge
 	}
 	select {
 	case <-initTimedOut:
-		if !finalOK(final, decErr) {
+		if !usable {
 			ge := Failed(stderrText, decErr)
 			ge.SessionID = final.SessionID
-			r.cleanup(final.SessionID)
 			return final, ge
 		}
 	default:
 	}
-	if ctx.Err() != nil && !finalOK(final, decErr) {
-		r.cleanup(final.SessionID)
+	if ctx.Err() != nil && !usable {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return final, &Error{Code: CodeTimeout, Message: "grok run exceeded the request timeout. Retry or raise -request-timeout.", SessionID: final.SessionID, Err: ctx.Err()}
 		}
 		return final, ctx.Err()
 	}
 	if ge, ok := AsError(decErr); ok {
-		r.cleanup(firstID(ge.SessionID, final.SessionID))
+		ge.SessionID = firstID(ge.SessionID, final.SessionID)
 		return final, ge
 	}
 	// Any decode error is a failed run, even when some text deltas already arrived.
@@ -200,7 +236,6 @@ func (r *Runner) Run(ctx context.Context, spec RunSpec, ev Events) (Final, error
 		if stderrText != "" {
 			ge.Message = ge.Message + ". stderr: " + strings.TrimSpace(stderrText)
 		}
-		r.cleanup(final.SessionID)
 		return final, ge
 	}
 	if waitErr != nil && decErr == nil && final.Text == "" && len(final.Structured) == 0 {
@@ -210,15 +245,22 @@ func (r *Runner) Run(ctx context.Context, spec RunSpec, ev Events) (Final, error
 			ge = Failed("", waitErr)
 			ge.SessionID = final.SessionID
 		}
-		r.cleanup(final.SessionID)
 		return final, ge
 	}
-	r.cleanup(final.SessionID)
 	return final, nil
 }
 
+// errSessionID returns the session id a *Error carries, or "" for any other error.
+// cleanup uses it so a session named only in an error record is deleted too.
+func errSessionID(err error) string {
+	if ge, ok := AsError(err); ok {
+		return ge.SessionID
+	}
+	return ""
+}
+
 // finalOK reports whether Decode produced a usable success.
-// An error result is not ok. errStop is handled by the caller before this.
+// An error result is not ok. ErrStop is handled by the caller before this.
 func finalOK(f Final, decErr error) bool {
 	if decErr != nil {
 		return false
@@ -226,31 +268,21 @@ func finalOK(f Final, decErr error) bool {
 	return f.Text != "" || len(f.Structured) != 0 || f.SessionID != "" && f.StopReason != ""
 }
 
-// Close signals every grok process group this runner still tracks.
-// SIGTERM is followed by SIGKILL after killGrace. A second call is a no-op.
-// Handlers blocked in Run unblock once the child dies, so the HTTP server can
-// finish Shutdown inside the 10s SIGINT budget.
-func (r *Runner) Close() {
-	r.mu.Lock()
-	pids := make([]int, 0, len(r.active))
-	for pid := range r.active {
-		pids = append(pids, pid)
+// workDir returns the run directory. An empty cwd uses the shared chat directory.
+// A set cwd (media mcwd) is created at 0700 and used as-is so media runs do not
+// share the chat directory. A mkdir failure is returned to the caller as grok_failed.
+func (r *Runner) workDir(cwd string) (string, error) {
+	if cwd == "" {
+		return r.cwd()
 	}
-	r.mu.Unlock()
-	for _, pid := range pids {
-		_ = signalGroup(pid, syscall.SIGTERM)
+	if err := os.MkdirAll(cwd, 0o700); err != nil {
+		return "", err
 	}
-	if len(pids) == 0 {
-		return
-	}
-	time.Sleep(killGrace)
-	for _, pid := range pids {
-		_ = signalGroup(pid, syscall.SIGKILL)
-	}
+	return cwd, nil
 }
 
 // cwd returns the shared empty working directory, creating it if needed.
-// Every run uses this same directory so grok cannot see a project checkout.
+// Every chat run uses this same directory so grok cannot see a project checkout.
 func (r *Runner) cwd() (string, error) {
 	dir := filepath.Join(r.root(), "cwd")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -288,6 +320,11 @@ func (r *Runner) writePrompt(body string) (string, error) {
 	return path, nil
 }
 
+// RootDir is the parent of cwd/, prompts/, mcwd/, and the media store.
+// An empty Runner.Root means os.TempDir()/agent-mock. Callers use it to place
+// files the process must delete on shutdown. It does not create the directory.
+func (r *Runner) RootDir() string { return r.root() }
+
 // root is the agent-mock temp directory.
 func (r *Runner) root() string {
 	if r.Root != "" {
@@ -296,125 +333,19 @@ func (r *Runner) root() string {
 	return filepath.Join(os.TempDir(), "agent-mock")
 }
 
-// cleanup deletes the grok session unless KeepSessions is set or id is empty.
-// Deletion is best-effort and does not block the HTTP response.
-func (r *Runner) cleanup(id string) {
-	if r.KeepSessions || id == "" || id == "probe" {
-		return
+// bin is the grok executable: Bin, or "grok" on PATH when Bin is empty.
+func (r *Runner) bin() string {
+	if r.Bin == "" {
+		return "grok"
 	}
-	bin := r.Bin
-	if bin == "" {
-		bin = "grok"
-	}
-	parent := os.Environ()
+	return r.Bin
+}
+
+// environ returns a copy of the parent environment for grok children: Environ()
+// when set, otherwise os.Environ(). Callers pass it through ChildEnv before exec.
+func (r *Runner) environ() []string {
 	if r.Environ != nil {
-		parent = append([]string(nil), r.Environ()...)
+		return append([]string(nil), r.Environ()...)
 	}
-	go DeleteSession(bin, id, parent)
-}
-
-// track records a live process group leader.
-func (r *Runner) track(pid int) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.active == nil {
-		r.active = map[int]struct{}{}
-	}
-	r.active[pid] = struct{}{}
-}
-
-// untrack forgets a process group after Wait returns.
-func (r *Runner) untrack(pid int) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.active, pid)
-}
-
-// killOnCancel SIGTERMs pid when ctx ends, then SIGKILLs after killGrace.
-// waitDone closed means the process already exited, so a recycled pid is not signaled.
-func (r *Runner) killOnCancel(ctx context.Context, pid int, waitDone chan struct{}) {
-	select {
-	case <-ctx.Done():
-		_ = signalGroup(pid, syscall.SIGTERM)
-		select {
-		case <-waitDone:
-		case <-time.After(killGrace):
-			_ = signalGroup(pid, syscall.SIGKILL)
-		}
-	case <-waitDone:
-	}
-}
-
-// signalGroup delivers sig to the process group. A dead group returns an error that callers ignore.
-func signalGroup(pid int, sig syscall.Signal) error {
-	if pid <= 0 {
-		return fmt.Errorf("bad pid")
-	}
-	err := syscall.Kill(-pid, sig)
-	if err != nil {
-		_ = syscall.Kill(pid, sig)
-	}
-	return err
-}
-
-// ToolsEmpty reports whether init.tools is a JSON empty array.
-// Null, missing, or a non-empty array is not empty: the run must be killed.
-func ToolsEmpty(raw []byte) bool {
-	return bytes.Equal(bytes.TrimSpace(raw), []byte("[]"))
-}
-
-// wrapMark invokes mark before the message-start callback so the init timer stops
-// even when the first record is a message rather than system/init.
-func wrapMark(fn func(string, string) error, mark func()) func(string, string) error {
-	return func(sessionID, model string) error {
-		mark()
-		if fn == nil {
-			return nil
-		}
-		return fn(sessionID, model)
-	}
-}
-
-// wrapText invokes mark before forwarding a delta. A text-only JSON result has no deltas.
-func wrapText(fn func(string) error, mark func()) func(string) error {
-	return func(delta string) error {
-		mark()
-		if fn == nil {
-			return nil
-		}
-		return fn(delta)
-	}
-}
-
-// firstID returns the first non-empty session id.
-func firstID(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
-}
-
-// tailBuf keeps the last max bytes written to it.
-type tailBuf struct {
-	mu  sync.Mutex
-	buf []byte
-	max int
-}
-
-// Write appends p and drops bytes older than max. It never fails.
-func (t *tailBuf) Write(p []byte) (int, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.buf = append(t.buf, p...)
-	if len(t.buf) > t.max {
-		t.buf = append([]byte(nil), t.buf[len(t.buf)-t.max:]...)
-	}
-	return len(p), nil
-}
-
-// String returns the retained stderr tail.
-func (t *tailBuf) String() string {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return string(t.buf)
+	return os.Environ()
 }

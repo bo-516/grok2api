@@ -41,6 +41,16 @@ type ProbeResult struct {
 	ToolsetEmpty bool
 	// ToolsetError is why the toolset could not be confirmed. Empty on success.
 	ToolsetError string
+	// MediaChecked adds the media banner line. False leaves chat banners unchanged.
+	MediaChecked bool
+	// MediaOff prints "media off (-media=false)" and means no media probe ran.
+	MediaOff bool
+	// MediaOffered is the media tools grok advertised, in probe order.
+	MediaOffered []string
+	// MediaMissing is the allowlist entries the probe did not see.
+	MediaMissing []string
+	// MediaKeep is the file TTL printed on the banner, such as 1h.
+	MediaKeep string
 }
 
 // Probe runs `grok --version`, `grok models`, and a toolset probe that is killed at init.
@@ -224,6 +234,9 @@ func FormatStartup(version, baseURL, apiKeyHint string, maxConc int, p ProbeResu
 			detail = "not checked"
 		}
 		fmt.Fprintf(&b, "toolset   unchecked (%s), permission-mode=dontAsk\n", detail)
+	}
+	if line := mediaBanner(p); line != "" {
+		b.WriteString(line)
 	}
 	fmt.Fprintf(&b, "listen    %s  (max %d concurrent grok runs)\n", baseURL, maxConc)
 	if apiKeyHint == "" {

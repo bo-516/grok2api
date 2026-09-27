@@ -45,6 +45,28 @@ func TestCommandArgs(t *testing.T) {
 	}
 }
 
+// TestMediaCommandArgs keeps chat flags for an empty tool list and emits the
+// media allowlist when Tools is set. Chat must not gain bypassPermissions.
+func TestMediaCommandArgs(t *testing.T) {
+	chat := strings.Join(CommandArgs("/p", "/c", RunSpec{}), " ")
+	if !strings.Contains(chat, "--tools todo_write") || !strings.Contains(chat, "--disallowed-tools search_tool,use_tool,todo_write") || !strings.Contains(chat, "--permission-mode dontAsk") || !strings.Contains(chat, "--max-turns 1") {
+		t.Fatal(chat)
+	}
+	media := strings.Join(CommandArgs("/p", "/mcwd", RunSpec{
+		Tools: []string{"image_gen"}, MaxTurns: 2, PermissionMode: "bypassPermissions",
+	}), " ")
+	if !strings.Contains(media, "--tools image_gen") || !strings.Contains(media, "--disallowed-tools search_tool,use_tool") || !strings.Contains(media, "--permission-mode bypassPermissions") || !strings.Contains(media, "--max-turns 2") {
+		t.Fatal(media)
+	}
+	if strings.Contains(media, "todo_write") {
+		t.Fatal(media)
+	}
+	both := strings.Join(CommandArgs("/p", "/mcwd", RunSpec{Tools: []string{"image_gen", "reference_to_video"}, MaxTurns: 3, PermissionMode: "bypassPermissions"}), " ")
+	if !strings.Contains(both, "--tools image_gen,reference_to_video") {
+		t.Fatal(both)
+	}
+}
+
 // TestChildEnv strips XAI_API_KEY and forces the restricted grok variables.
 func TestChildEnv(t *testing.T) {
 	env := ChildEnv([]string{"PATH=/bin", "XAI_API_KEY=secret", "GROK_MEMORY=1", "HOME=/tmp"})

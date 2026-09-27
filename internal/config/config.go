@@ -58,8 +58,9 @@ type Config struct {
 	// RequestTimeout is the hard limit for one grok run.
 	// Expiry SIGTERMs the process group and returns 504 grok_timeout.
 	RequestTimeout time.Duration
-	// KeepSessions leaves grok sessions on disk. Default false deletes them
-	// with a non-interactive `grok sessions delete`.
+	// KeepSessions leaves grok sessions and grok's prompt_history.jsonl on disk.
+	// Default false deletes each session with a non-interactive `grok sessions delete`
+	// after its run, retries leftovers at the next start, and removes the prompt history.
 	KeepSessions bool
 	// LogPrompts includes the rendered prompt on the single access-log line.
 	// Default false, so prompt text never reaches the log.
@@ -67,6 +68,18 @@ type Config struct {
 	// ShowVersion means -version was set. main prints the version and exits 0
 	// without listening or probing grok.
 	ShowVersion bool
+	// Media serves /v1/images, /v1/videos, and /v1/media. Default true.
+	// False returns 404 media_disabled and skips the media tool probe.
+	Media bool
+	// MediaTTL is how long generated files and video jobs are kept.
+	// Values under 1 minute are rejected at startup with exit 2.
+	MediaTTL time.Duration
+	// VideoTimeout is the hard limit for one video grok run.
+	// Zero or negative is rejected at startup with exit 2.
+	VideoTimeout time.Duration
+	// MaxVideoJobs is queued plus running video jobs before POST returns 429.
+	// Values under 1 are rejected at startup with exit 2.
+	MaxVideoJobs int
 }
 
 // Help is the -help text. Flag names match the design doc so operators can paste them.
@@ -80,8 +93,12 @@ const Help = `agent-mock: OpenAI-compatible LLM endpoint for local dev, backed b
   -max-concurrency int       simultaneous grok runs (default 4)
   -queue-timeout duration    max wait for a free run slot before 429 (default 30s)
   -request-timeout duration  hard limit per grok run (default 3m0s)
-  -keep-sessions             keep the grok sessions agent-mock creates (default: delete them)
+  -keep-sessions             keep grok sessions and prompt history (default: delete both)
   -log-prompts               log rendered prompts (default off)
+  -media                     serve /v1/images/*, /v1/videos/*, /v1/media/* (default true)
+  -media-ttl duration        keep generated files and video jobs this long (default 1h0m0s)
+  -video-timeout duration    hard limit per video grok run (default 10m0s)
+  -max-video-jobs int        queued plus running video jobs before 429 (default 2)
   -version                   print version and exit
 `
 
@@ -109,8 +126,12 @@ func Parse(args []string, getenv func(string) string) (Config, error) {
 	fs.IntVar(&cfg.MaxConcurrency, "max-concurrency", 4, "simultaneous grok runs")
 	fs.DurationVar(&cfg.QueueTimeout, "queue-timeout", 30*time.Second, "wait for a free grok slot")
 	fs.DurationVar(&cfg.RequestTimeout, "request-timeout", 3*time.Minute, "hard limit per grok run")
-	fs.BoolVar(&cfg.KeepSessions, "keep-sessions", false, "keep grok sessions")
+	fs.BoolVar(&cfg.KeepSessions, "keep-sessions", false, "keep grok sessions and prompt history")
 	fs.BoolVar(&cfg.LogPrompts, "log-prompts", false, "log rendered prompts")
+	fs.BoolVar(&cfg.Media, "media", true, "serve image and video routes")
+	fs.DurationVar(&cfg.MediaTTL, "media-ttl", time.Hour, "keep generated files and video jobs")
+	fs.DurationVar(&cfg.VideoTimeout, "video-timeout", 10*time.Minute, "hard limit per video grok run")
+	fs.IntVar(&cfg.MaxVideoJobs, "max-video-jobs", 2, "queued plus running video jobs before 429")
 	fs.BoolVar(&cfg.ShowVersion, "version", false, "print version and exit")
 
 	if err := fs.Parse(args); err != nil {
@@ -178,6 +199,15 @@ func validate(cfg *Config) error {
 	}
 	if cfg.GrokBin == "" {
 		return &Error{Exit: 2, Msg: "-grok-bin is required"}
+	}
+	if cfg.MediaTTL < time.Minute {
+		return &Error{Exit: 2, Msg: "-media-ttl must be >= 1m"}
+	}
+	if cfg.VideoTimeout <= 0 {
+		return &Error{Exit: 2, Msg: "-video-timeout must be > 0"}
+	}
+	if cfg.MaxVideoJobs < 1 {
+		return &Error{Exit: 2, Msg: "-max-video-jobs must be >= 1"}
 	}
 	return nil
 }

@@ -71,7 +71,8 @@ func usageDoc(origin, apiKey string, showKey bool) string {
 	}
 	body := strings.ReplaceAll(usageDocText, "{{origin}}", origin)
 	body = strings.ReplaceAll(body, "{{key}}", keyLine)
-	return strings.ReplaceAll(body, "{{model}}", publicModel)
+	body = strings.ReplaceAll(body, "{{model}}", publicModel)
+	return body + strings.ReplaceAll(mediaDoc, "{{origin}}", origin)
 }
 
 // usageDocText is the guide body. {{origin}} is scheme://host, {{key}} is the
@@ -138,7 +139,7 @@ content 用字符串，或 [{"type":"text","text":"..."}]。多段文本会按�
 
 可以写但不会改变结果：temperature、top_p、max_tokens、max_completion_tokens、stop、seed、presence_penalty、frequency_penalty。
 
-会返回 400：n 不是 1、logprobs、top_logprobs、图片、音频、文件、未知 role。
+会返回 400：n 不是 1、logprobs、top_logprobs、消息里的图片、音频、文件、未知 role。出图和出视频用第 6、7 节，不要放进 messages。
 
 其它地址：
 GET {{origin}}/v1/models

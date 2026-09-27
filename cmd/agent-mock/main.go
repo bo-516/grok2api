@@ -9,17 +9,27 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/shaoboli/agent-mock/internal/config"
 	"github.com/shaoboli/agent-mock/internal/grok"
+	"github.com/shaoboli/agent-mock/internal/media"
 	"github.com/shaoboli/agent-mock/internal/server"
 	"github.com/shaoboli/agent-mock/internal/version"
 )
 
-// main parses config, probes grok, listens, and on SIGINT kills in-flight grok groups.
+// exitGrace bounds how long a failed start waits for background session deletes
+// (at least the startup probe's) before the process exits.
+const exitGrace = 5 * time.Second
+
+// main parses config, sweeps leftovers of earlier runs, probes grok, listens, and on
+// SIGINT kills in-flight grok groups, then lets pending session deletes finish.
+// The whole shutdown shares one 10 s budget. A delete that does not finish in time
+// stays recorded under the temp root and the next start retries it.
 // A non-loopback address without -api-key exits 2 before the socket opens.
 // -version prints the version and does not probe grok. -help exits 0.
 func main() {
@@ -41,11 +51,58 @@ func main() {
 		fmt.Printf("agent-mock v%s\n", version.Version)
 		os.Exit(0)
 	}
-	runner := &grok.Runner{Bin: cfg.GrokBin, KeepSessions: cfg.KeepSessions}
+	runner := &grok.Runner{Bin: cfg.GrokBin, KeepSessions: cfg.KeepSessions, Log: os.Stderr}
+	// A killed or timed-out earlier process can leave sessions and prompt history.
+	runner.Sweep()
+	var store *media.Store
+	var jobs *media.Jobs
+	if cfg.Media {
+		_ = os.RemoveAll(filepath.Join(runner.RootDir(), "mcwd", "in"))
+		var err error
+		store, err = media.NewStore(filepath.Join(runner.RootDir(), "media"), cfg.MediaTTL)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+		jobs = media.NewJobs(cfg.MaxVideoJobs, cfg.MediaTTL)
+	}
 	probeCtx, cancelProbe := context.WithTimeout(context.Background(), 14*time.Second)
-	probed := grok.Probe(probeCtx, cfg.GrokBin, runner)
+	var probed grok.ProbeResult
+	var mediaProbe grok.MediaProbe
+	var probeWG sync.WaitGroup
+	probeWG.Add(1)
+	go func() {
+		defer probeWG.Done()
+		probed = grok.Probe(probeCtx, cfg.GrokBin, runner)
+	}()
+	if cfg.Media {
+		probeWG.Add(1)
+		go func() {
+			defer probeWG.Done()
+			mediaProbe = grok.ProbeMedia(probeCtx, runner)
+		}()
+	}
+	probeWG.Wait()
 	cancelProbe()
+	probed.MediaChecked = true
+	probed.MediaKeep = shortKeep(cfg.MediaTTL)
+	if cfg.Media {
+		probed.MediaOffered = mediaProbe.Offered
+		probed.MediaMissing = mediaProbe.Missing
+	} else {
+		probed.MediaOff = true
+	}
 	srv := server.New(cfg, runner)
+	if cfg.Media {
+		srv.Store = store
+		srv.Stager = &media.Stager{Root: filepath.Join(runner.RootDir(), "mcwd"), Store: store}
+		srv.Jobs = jobs
+		if mediaProbe.Offered == nil {
+			srv.MediaTools = []string{}
+		} else {
+			srv.MediaTools = append([]string(nil), mediaProbe.Offered...)
+		}
+	}
 	srv.Known = modelIDs(probed.Models)
 	srv.DefaultModel = probed.DefaultModel
 	srv.GrokVersion = probed.Version
@@ -69,22 +126,51 @@ func main() {
 	}()
 	if err := waitListening(cfg.Addr, errCh); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
-		os.Exit(1)
+		exitAfterDeletes(runner, 1)
 	}
 	// Print only after the port accepts connections so the listen line is already true.
 	fmt.Fprint(os.Stderr, grok.FormatStartup(version.Version, listenBase(cfg.Addr), cfg.APIKey, cfg.MaxConcurrency, probed))
 	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	if cfg.Media && store != nil {
+		go func() {
+			tick := time.NewTicker(5 * time.Minute)
+			defer tick.Stop()
+			for {
+				select {
+				case <-sigCtx.Done():
+					return
+				case <-tick.C:
+					store.Sweep()
+					if jobs != nil {
+						jobs.Sweep()
+					}
+				}
+			}
+		}()
+	}
 	select {
 	case <-sigCtx.Done():
 	case err := <-errCh:
 		fmt.Fprintln(os.Stderr, err.Error())
-		os.Exit(1)
+		exitAfterDeletes(runner, 1)
 	}
-	runner.Close()
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	runner.Close()
 	_ = httpSrv.Shutdown(shutCtx)
+	// Handlers have returned, so every run has started its session delete.
+	runner.Wait(shutCtx)
+}
+
+// exitAfterDeletes waits up to exitGrace for background session deletes, then exits
+// with code. Without the wait, the probe session of a start that failed to listen
+// would stay on disk until the next start.
+func exitAfterDeletes(runner *grok.Runner, code int) {
+	ctx, cancel := context.WithTimeout(context.Background(), exitGrace)
+	runner.Wait(ctx)
+	cancel()
+	os.Exit(code)
 }
 
 // waitListening returns when addr accepts a TCP connection or the listener reports an error.
@@ -120,6 +206,15 @@ func listenBase(addr string) string {
 		host = "[" + host + "]"
 	}
 	return "http://" + host + ":" + port + "/v1"
+}
+
+// shortKeep prints a TTL the way the banner does. Whole hours stay as 1h.
+// Other values use Go's duration string. A zero duration is 0s.
+func shortKeep(d time.Duration) string {
+	if d > 0 && d%time.Hour == 0 {
+		return fmt.Sprintf("%dh", int(d/time.Hour))
+	}
+	return d.String()
 }
 
 // modelIDs copies probe models into the server's known-id list.

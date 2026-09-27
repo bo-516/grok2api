@@ -1,9 +1,26 @@
 #!/bin/sh
 # Curl smoke test for a running agent-mock. Local dev only.
-# Usage: ./scripts/smoke.sh [base-url-without-/v1]
+# Usage: ./scripts/smoke.sh [--media] [base-url-without-/v1]
 set -eu
+MEDIA=0
+if [ "${1:-}" = "--media" ]; then
+  MEDIA=1
+  shift
+fi
 BASE="${1:-http://127.0.0.1:8787}"
 HDR='Content-Type: application/json'
+if [ "$MEDIA" = 1 ]; then
+  echo "== image =="
+  BODY=$(curl -sS "$BASE/v1/images/generations" -H "$HDR" \
+    -d '{"prompt":"A red apple on a white table","size":"1024x1024"}')
+  echo "$BODY"
+  URL=$(printf '%s' "$BODY" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')
+  if [ -n "$URL" ]; then
+    echo "== download =="
+    curl -sS -D - -o /dev/null "$URL" | head -n 20
+  fi
+  exit 0
+fi
 
 echo "== text =="
 curl -sS "$BASE/v1/chat/completions" -H "$HDR" \

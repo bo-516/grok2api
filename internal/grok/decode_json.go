@@ -95,6 +95,58 @@ func mergeUsage(prev Usage, raw json.RawMessage) Usage {
 	return next
 }
 
+// finish builds the Final from accumulated fields.
+// Streamed text wins, then the result string, then assistant text.
+func (d *decoder) finish() Final {
+	text := d.text.String()
+	if text == "" {
+		text = d.resultText
+	}
+	if text == "" {
+		text = d.fallback
+	}
+	return Final{
+		Text:       text,
+		Structured: d.structured,
+		StopReason: d.stopReason,
+		SessionID:  d.sessionID,
+		Model:      d.model,
+		Usage:      d.usage,
+	}
+}
+
+// noteSession keeps the latest non-empty session id.
+// An empty id does not clear one already seen.
+func (d *decoder) noteSession(id string) {
+	if id != "" {
+		d.sessionID = id
+	}
+}
+
+// noteModel ignores blank and "unknown", which a logged-out init uses as a placeholder.
+func (d *decoder) noteModel(model string) {
+	if model != "" && model != "unknown" {
+		d.model = model
+	}
+}
+
+// noteModelUsage reads the single key of modelUsage as the model id.
+// Zero or many keys leave the model unchanged. A bad object is ignored.
+func (d *decoder) noteModelUsage(raw json.RawMessage) {
+	if len(raw) == 0 {
+		return
+	}
+	var models map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &models); err != nil {
+		return
+	}
+	if len(models) == 1 {
+		for name := range models {
+			d.noteModel(name)
+		}
+	}
+}
+
 // jsonInt reads an integer. JSON numbers may arrive as json.Number. Non-numbers return false.
 func jsonInt(m map[string]json.RawMessage, key string) (int, bool) {
 	raw, ok := m[key]

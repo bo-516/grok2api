@@ -4,14 +4,13 @@
 |---|---|
 | 日期 | 26-09-23 |
 | 状态 | Draft |
-| 修订 | 1 |
-| 仓库 | `agent-mock`（尚未 `git init`，没有分支/提交；目前只有 `AGENTS.md`） |
-| 相关 | 暂无其它计划；调用方参考 `../vibe-coding/backend`（openai-go v3） |
+| 修订 | 2 |
+| 仓库 | [grok2api](https://github.com/bo-516/grok2api)（命令名 `agent-mock`） |
 
 > **原始需求（原文）：** 我希望做一个本地开发时候可以mock llm api的功能
 > 使用 grok-build 订阅 我记得grok可以通过命令行 执行某个问题 然后 通过json返回
 >
-> 做一个程序 在其他 后端仓库 可以调用它 比如在go作为web后端的程序中 可能要访问的时候 在dev模式下访问这个工具(订阅的问题交给开发者自行解决 且自行登录)
+> 做一个程序，调用方在 dev 模式下访问这个工具（订阅由开发者自行解决，并自行登录）
 
 ## 1. TL;DR
 
@@ -25,7 +24,6 @@
 
 **现状**
 - 本仓库只有 `AGENTS.md`。它要求每个逻辑单元写 en-us 注释（写清用途、参数、返回值、传错的后果），文件超过 200 行就考虑拆分，超过 440 行必须拆分。
-- 用户 Go 后端调 LLM 的写法：`../vibe-coding/backend/internal/chat/adk_llm.go:37` 用 `openai.NewClient(option.WithAPIKey(…), option.WithBaseURL(cfg.OpenAIBaseURL))` 创建客户端，`:104` 调 `Chat.Completions.New`，`:124` 调 `Chat.Completions.NewStreaming`，依赖 `github.com/openai/openai-go/v3 v3.54.0`。注意这条是已废弃的 legacy chat 路径，vibe-coding 现在的主路径走 Codex + `/v1/responses`，不在本期范围。
 - 本机的 `grok` 是 Grok Build CLI 1.0.41（`~/.grok/bin/grok`）。`grok models` 显示已用 grok.com 账号登录，可用模型有 `grok-4.7`、`grok-4.7-build-fast`（默认）、`grok-4.6`、`grok-4.5`。
 - Grok 官方 README（`~/.grok/README.md` 中 “Building with Grok → Headless Mode” 一节）本身就示范了把 `grok -p` 包装成 OpenAI 兼容后端。
 
@@ -71,7 +69,7 @@
 **非目标**
 - 录制/回放缓存、静态 fixture、离线模式（用户选了“只实时转发 grok”）。
 - 生产环境使用、多人共用一个账号、部署到服务器；也不支持 Windows（实现依赖 Unix 进程组）。
-- 其它协议：`/v1/responses`（Codex 用的）、`/v1/embeddings`、`/v1/completions`、Anthropic `/v1/messages`、Gemini `generateContent`。
+- 其它协议：`/v1/responses`、`/v1/embeddings`、`/v1/completions`、Anthropic `/v1/messages`、Gemini `generateContent`。
 - 图片、音频、文件输入：带 `image_url`、`input_audio`、`file` 片段的请求一律返回 400。
 - 让采样参数真正生效：`temperature`、`top_p`、`max_tokens`、`max_completion_tokens`、`stop`、`seed`、惩罚项这些 CLI 都没有对应参数，只接收不生效；`n>1` 和 `logprobs` 直接返回 400。
 - 安装 grok、登录、购买订阅、管理额度，这些都由开发者自己负责；也不追求和生产模型行为一致或精确的 token 计费。
@@ -262,7 +260,7 @@ Write the assistant's next message.
 
 | 路径 | 变更 | 原因 |
 |---|---|---|
-| `go.mod` (new) | 新增 | `github.com/shaoboli/agent-mock`，go 1.25；openai-go/v3 v3.54.0 只给测试和示例用 |
+| `go.mod` (new) | 新增 | 模块路径见本仓库 `go.mod`，go 1.25；openai-go/v3 v3.54.0 只给测试和示例用 |
 | `cmd/agent-mock/main.go` (new) | 新增 | 解析配置、启动自检、启动服务、优雅退出（SIGINT 后 10 s 内杀掉所有运行中的进程） |
 | `internal/config/config.go` (new) | 新增 | 解析 flag 和 `AGENT_MOCK_*`，校验 loopback 与 api-key、时长、`-model-map` |
 | `internal/grok/args.go` (new) | 新增 | 受限参数集和子进程环境，把 `RunSpec` 转成 argv/env |
@@ -328,9 +326,9 @@ grok 失败的分类方法是在 message 和 stderr 里做不区分大小写的�
 - 直连 `cli-chat-proxy.grok.com/v1/chat/completions`（README 里 “Using auth.json for API Access”，用 `~/.grok/auth.json` 的令牌）：能省掉 4–6k token 的开销和进程启动时间，但要模仿 CLI 的内部请求头，令牌 7 天过期，还得读凭据文件，也不符合“通过命令行调用”的初衷。留作 Phase 2 的可选后端。
 - `grok agent stdio`（ACP，即 Agent Client Protocol，基于 JSON-RPC 的常驻进程）：省下的进程启动时间占比不大（实测 CPU 约 1.0 s，墙钟 5–6 s），但要实现的协议面大。留到 Phase 2。
 - 用 `--resume` 复用 grok 会话来做多轮：会引入状态和并发冲突，和 OpenAI 的无状态语义也不一致。否决。
-- 同时提供 Anthropic `/v1/messages`：grok 的流本来就是 Messages 格式，但用户仓库里没有用 anthropic-sdk-go 的调用方。否决。
-- 做成 Go 库嵌进后端（自定义 `http.RoundTripper`）：只能给 Go 用，而且每个后端都要加依赖；换 base URL 则完全不用改代码。否决。
-- 用 Node/TS 或 Python 实现：用户仓库以 Go 为主（`agent-kit`、`vibe-coding/backend` 等），Go 单二进制用 `go install` 分发最省事。否决。
+- 同时提供 Anthropic `/v1/messages`：grok 的流本来就是 Messages 格式。本期只做 OpenAI Chat Completions。否决。
+- 做成 Go 库嵌进调用方进程（自定义 `http.RoundTripper`）：只能给 Go 用，而且每个调用方都要加依赖；换 base URL 则完全不用改代码。否决。
+- 用 Node/TS 或 Python 实现：示例和测试用 Go，单二进制用 `go install` 分发。否决。
 - 靠 `--sandbox` 做隔离：本机上 `strict` 因为 docker.sock 是符号链接起不来。以后可以作为可选加固。
 
 ## 8. 实施步骤
@@ -401,7 +399,7 @@ OPENAI_BASE_URL=http://127.0.0.1:8787/v1 OPENAI_API_KEY=dev go run ./examples/go
 
 ## 10. 上线与风险
 
-上线方式：`git init` 后推到 `github.com/shaoboli/agent-mock`（Q-4）。开发者用 `go install github.com/shaoboli/agent-mock/cmd/agent-mock@latest` 安装，各后端只在本地 dev 配置里设置 `OPENAI_BASE_URL`，生产配置不变。回滚就是删掉这项配置。不需要 feature flag，也没有数据迁移。
+上线方式：仓库是 <https://github.com/bo-516/grok2api>。在仓库目录执行 `go install ./cmd/agent-mock`。调用方只在本地 dev 配置里设置 `OPENAI_BASE_URL`，生产配置不变。回滚就是删掉这项配置。不需要 feature flag，也没有数据迁移。
 
 | 风险 | 可能性 | 影响 | 缓解 |
 |---|---|---|---|
@@ -416,14 +414,14 @@ OPENAI_BASE_URL=http://127.0.0.1:8787/v1 OPENAI_API_KEY=dev go run ./examples/go
 
 | ID | 假设 | 理由 | 如何推翻 |
 |---|---|---|---|
-| A-1 | 用 Go 1.25 实现，模块路径 `github.com/shaoboli/agent-mock`，服务端只用标准库 | 兄弟仓库都是这个形态（`../agent-kit/go.mod` 是 `github.com/shaoboli/agent-kit`，go 1.25.0），调用方也是 Go | 改 `go.mod` 的模块路径 |
-| A-2 | 只做 OpenAI Chat Completions（加 `/v1/models`） | 用户的 Go 代码用的是 openai-go 的 `Chat.Completions` | 在 `internal/server` 里再加协议适配 |
+| A-1 | 用 Go 1.25 实现，模块路径以本仓库 `go.mod` 为准，服务端只用标准库 | 示例和测试用 Go；对外仓库是 <https://github.com/bo-516/grok2api> | 改 `go.mod` 的模块路径 |
+| A-2 | 只做 OpenAI Chat Completions（加 `/v1/models`） | 示例用 openai-go 的 `Chat.Completions` | 在 `internal/server` 里再加协议适配 |
 | A-3 | 用户选的“再加 tool calling 模拟”包含推荐项里的文本、流式和 JSON 输出 | 选项文字里的“再加”是在推荐项基础上追加 | 去掉 FR-3（工作量小） |
 | A-4 | agent-mock 是开发者自己启动的常驻进程，后端只通过配置切换 | 需求原文是“访问这个工具”，这样零代码改动 | Phase 2 提供嵌入式辅助包 |
 | A-5 | 默认监听 `127.0.0.1:8787`，默认并发 4，排队超时 30 s，单次运行超时 3 min | 只绑 loopback 防止局域网里的人蹭订阅；4 个并发足够单人开发 | 用 flag 或环境变量覆盖 |
 | A-6 | 每个请求都无状态，把完整对话转写成一个提示词，不复用 grok 会话 | 与 OpenAI 语义一致，也不会有并发冲突 | — |
 | A-7 | 丢弃 grok 的 thinking 内容，不输出 `reasoning_content` | openai-go 没有标准字段 | 加 flag 以非标准字段输出 |
-| A-8 | 后端跑在宿主机上；如果跑在 Docker 里，就用 `-addr 0.0.0.0:8787 -api-key …` 加 `host.docker.internal` | 用户仓库里的后端都是 `go run` | — |
+| A-8 | 调用方跑在宿主机上；如果跑在 Docker 里，就用 `-addr 0.0.0.0:8787 -api-key …` 加 `host.docker.internal` | 本地开发默认在本机启动 | — |
 | A-9 | 子进程去掉 `XAI_API_KEY`，所以没登录时直接报错，而不是悄悄按 token 计费 | 用户明确要用订阅 | 加一个显式开关允许透传 |
 | A-10 | 受限参数集和测得的数字只对 grok 1.0.41（26-09-23）成立 | 实测的就是这个版本 | 升级后重跑步骤 1 的清单 |
 
@@ -432,8 +430,9 @@ OPENAI_BASE_URL=http://127.0.0.1:8787/v1 OPENAI_API_KEY=dev go run ./examples/go
 | Q-1 | 加了 `--json-schema` 后，还会按 `streaming-messages-json` 流式输出吗，还是会被强制改成 `json`？如果是后者，这类运行没有 init 行，没法逐次校验工具集，只能靠同一受限参数集加启动探测兜底，需要在本文写明 | 步骤 7 选真流式还是伪流式；FR-13 的适用范围 | 实现者（步骤 1） |
 | Q-2 | grok 的结构化输出接受 `anyOf` 加 `enum` 这种按工具区分的信封吗？ | 步骤 8 用严格版还是宽松版 schema | 实现者（步骤 1） |
 | Q-3 | `grok sessions delete <id>` 能不能无交互执行？session 列表该用什么命令查？ | FR-15、AC-17 | 实现者（步骤 1） |
-| Q-4 | 仓库是否推到 `github.com/shaoboli/agent-mock`，供其他开发者 `go install`？ | 步骤 10 README 的安装说明 | 用户 |
+| Q-4 | 对外仓库是 <https://github.com/bo-516/grok2api>，安装方式是在仓库目录执行 `go install ./cmd/agent-mock` | 步骤 10 README 的安装说明 | 已落地 |
 
 ## 12. 变更记录
 
 - r1 26-09-23：初稿。基于在 grok 1.0.41 上的实测，以及用户的两项澄清：tool calling 模拟 = 要做；mock 模式 = 只做实时转发。
+- r2 26-09-27：文档里的仓库地址统一为 <https://github.com/bo-516/grok2api>。

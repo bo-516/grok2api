@@ -28,8 +28,22 @@ const (
 	CodeStructured = "grok_structured_output_failed"
 	// CodeTimeout means the request deadline killed the process group.
 	CodeTimeout = "grok_timeout"
-	// CodeUnsafe means the init record did not advertise an empty tool list.
+	// CodeUnsafe means the init record advertised a tool outside the allowlist.
+	// A chat run's allowlist is empty, so any tool is unsafe.
 	CodeUnsafe = "unsafe_grok_toolset"
+	// CodeUnsafeInput means a media tool call named a path, URL, or data URI
+	// that is not one of this request's staged inputs or this run's own outputs.
+	CodeUnsafeInput = "unsafe_grok_tool_input"
+	// CodeContentPolicy means the media tool refused the prompt as a moderation block.
+	CodeContentPolicy = "content_policy_violation"
+	// CodeMediaUnavailable means the subscription, ZDR, or feature flags do not
+	// offer the media tool the run asked for.
+	CodeMediaUnavailable = "grok_media_unavailable"
+	// CodeMediaFailed means a media tool failed for a reason that is not moderation
+	// or a missing feature, or the run stored fewer files than the plan.
+	CodeMediaFailed = "grok_media_failed"
+	// CodeMaxTurns means grok stopped with error_max_turns before the plan finished.
+	CodeMaxTurns = "grok_max_turns"
 )
 
 // Error is a classified grok failure. Code selects the HTTP status.
@@ -106,6 +120,28 @@ func containsAny(s string, needles ...string) bool {
 		}
 	}
 	return false
+}
+
+// ClassifyMedia maps a media tool_result error string onto a *Error.
+// Moderation language is content_policy_violation. Upgrade, subscription, ZDR,
+// and disabled-feature language is grok_media_unavailable. Everything else,
+// including a generic safety failure, is grok_media_failed so a video job maps
+// it to internal_error. text is grok's own sentence and is kept as Message.
+// An empty text still returns grok_media_failed with a fixed sentence.
+func ClassifyMedia(text string) *Error {
+	blob := strings.ToLower(text)
+	msg := strings.TrimSpace(text)
+	if msg == "" {
+		msg = "media tool failed"
+	}
+	switch {
+	case containsAny(blob, "content policy", "content_policy", "moderation", "violates", "flagged"):
+		return &Error{Code: CodeContentPolicy, Message: msg}
+	case containsAny(blob, "upgrade", "subscription", "zero data retention", "zdr", "not included", "premium", "feature is disabled", "features.video_gen", "features.image_gen", "not available on your"):
+		return &Error{Code: CodeMediaUnavailable, Message: msg}
+	default:
+		return &Error{Code: CodeMediaFailed, Message: msg}
+	}
 }
 
 // Failed builds a CodeFailed error that includes the stderr tail.

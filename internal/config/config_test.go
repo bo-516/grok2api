@@ -7,6 +7,42 @@ import (
 	"time"
 )
 
+// TestMediaFlags checks defaults, env overrides, and the exit-2 bounds.
+func TestMediaFlags(t *testing.T) {
+	cfg, err := Parse(nil, func(string) string { return "" })
+	if err != nil || !cfg.Media || cfg.MediaTTL != time.Hour || cfg.VideoTimeout != 10*time.Minute || cfg.MaxVideoJobs != 2 {
+		t.Fatalf("%+v %v", cfg, err)
+	}
+	cfg, err = Parse(nil, func(k string) string {
+		switch k {
+		case "AGENT_MOCK_MEDIA":
+			return "false"
+		case "AGENT_MOCK_MEDIA_TTL":
+			return "2m"
+		case "AGENT_MOCK_VIDEO_TIMEOUT":
+			return "30s"
+		case "AGENT_MOCK_MAX_VIDEO_JOBS":
+			return "3"
+		default:
+			return ""
+		}
+	})
+	if err != nil || cfg.Media || cfg.MediaTTL != 2*time.Minute || cfg.VideoTimeout != 30*time.Second || cfg.MaxVideoJobs != 3 {
+		t.Fatalf("%+v %v", cfg, err)
+	}
+	for _, args := range [][]string{
+		{"-media-ttl", "30s"},
+		{"-video-timeout", "0s"},
+		{"-max-video-jobs", "0"},
+	} {
+		_, err := Parse(args, func(string) string { return "" })
+		var ce *Error
+		if !errors.As(err, &ce) || ce.Exit != 2 {
+			t.Fatalf("%v %v", args, err)
+		}
+	}
+}
+
 // TestParseDefaults checks the documented defaults when no flags or env are set.
 func TestParseDefaults(t *testing.T) {
 	cfg, err := Parse(nil, func(string) string { return "" })
