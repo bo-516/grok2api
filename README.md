@@ -2,7 +2,7 @@
 
 本地开发用的 OpenAI Chat Completions 兼容服务。仓库：<https://github.com/bo-516/grok2api>。
 
-每个请求启动一次你本机已登录的 `grok`，把回复转成 `/v1/chat/completions`。给别的程序用时，模型名写 `superllm`。
+每个请求启动一次你本机已登录的 `grok`，把回复转成 `/v1/chat/completions`。请求里的 `model` 固定写 `superllm`。
 
 这是开发替身，不是生产服务。提示词会经 grok 发到 xAI。不要发送真实用户数据、密钥或未公开的代码。
 
@@ -20,7 +20,7 @@ go run ./cmd/agent-mock
 
 要装到 `PATH` 里，在仓库目录执行 `go install ./cmd/agent-mock`，然后直接运行 `agent-mock`。
 
-启动后终端会打印 grok 路径、登录状态、模型，以及要贴进调用方的两行环境变量：
+启动后终端会打印 grok 路径、登录状态、模型，以及下面两行环境变量：
 
 ```text
 OPENAI_BASE_URL=http://127.0.0.1:8787/v1
@@ -43,13 +43,13 @@ curl -sS http://127.0.0.1:8787/doc
 
 `strict: true` 时，参数 schema 必须是 object，`additionalProperties` 为 false，并且每个字段都在 `required` 里。旧参数 `functions` / `function_call` 也可以用，不要和 `tools` 同时写。
 
-Go 程序只改 base URL 和 API key，继续用 `Chat.Completions.New` 和 `NewStreaming`。对话里的图片、音频和文件内容仍返回 400。出图和出视频走下面的单独接口。
+仓库里的对话例子是 `examples/go-openai`。对话里的图片、音频和文件内容仍返回 400。出图和出视频走下面的单独接口。
 
 ## 图片与视频
 
-对话运行仍然是零工具。图片和视频各开一次 grok，只放开这一次需要的媒体工具（`image_gen`、`image_edit` 或 `reference_to_video`）。init 的工具集必须正好等于这次的白名单，模型给出的每个工具参数都会再检查一遍。不合规则杀掉进程组，调用方拿不到产物。
+对话运行仍然是零工具。图片和视频各开一次 grok，只放开这一次需要的媒体工具（`image_gen`、`image_edit` 或 `reference_to_video`）。init 的工具集必须正好等于这次的白名单，模型给出的每个工具参数都会再检查一遍。不合规则杀掉进程组，这次请求不会返回产物。
 
-图片用 OpenAI 的形状，openai-go 的 `Images.Generate` 和 `Images.Edit` 不用改代码：
+图片字段与 OpenAI Images 相同。仓库里的例子是 `examples/go-media`：
 
 ```bash
 curl -sS http://127.0.0.1:8787/v1/images/generations -H 'Content-Type: application/json' \
@@ -83,7 +83,7 @@ curl -sS http://127.0.0.1:8787/v1/images/generations -H 'Content-Type: applicati
 
 加 `-keep-sessions` 后，以上清理全部关闭，session 和提示词历史都保留，方便排查。
 
-每次调用都有固定的提示词开销（大约数千 input tokens）和数秒延迟。并发默认 4。额度用尽时返回 429。后端如果会自动重试 429，建议把重试关掉。
+每次调用都有固定的提示词开销（大约数千 input tokens）和数秒延迟。并发默认 4。额度用尽时返回 429。收到 429 后等几秒再试，不要立刻自动重试。
 
 ## 常用参数
 
